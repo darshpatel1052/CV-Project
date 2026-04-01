@@ -47,7 +47,7 @@ logs/
 *.log
 
 # Model checkpoints (optional, comment out if you want to track)
-# checkpoints/
+checkpoints/
 
 # Temporary test outputs
 datasets/processed_test/
