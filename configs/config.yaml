@@ -1,0 +1,197 @@
+# ============================================================================
+# Resolution-Agnostic Knowledge Distillation for Remote Sensing
+# Configuration File
+# ============================================================================
+
+# Project
+project_name: "RAKD-RemoteSensing"
+seed: 42
+
+# ============================================================================
+# DATASET CONFIGURATION
+# ============================================================================
+dataset:
+  name: "DOTA"  # DOTA v1.0
+  split: "train"
+  num_classes: 15  # plane, ship, storage-tank, ..., swimming-pool
+  classes:
+    - plane
+    - ship
+    - storage-tank
+    - baseball-diamond
+    - tennis-court
+    - basketball-court
+    - ground-track-field
+    - harbor
+    - bridge
+    - large-vehicle
+    - small-vehicle
+    - helicopter
+    - roundabout
+    - soccer-ball-field
+    - swimming-pool
+  
+  # Paths
+  raw_data_path: "./datasets/raw/DOTA_v1.0"
+  processed_data_path: "./datasets/processed"
+  
+  # For testing: use smaller subset
+  use_subset: true
+  subset_size: 20  # Use 20 images for quick iteration
+  
+  # Image resolutions
+  teacher_resolution: 1024  # HR images for teacher
+  student_resolution: 128   # LR images for student (4x downsampled)
+
+# ============================================================================
+# TEACHER MODEL CONFIGURATION
+# ============================================================================
+teacher:
+  backbone: "swin_tiny"  # Swin Transformer Tiny
+  pretrained: true       # Use ImageNet pretrained weights
+  fpn:
+    in_channels: [96, 192, 384, 768]  # Swin-T output channels per stage
+    out_channels: 256
+    num_levels: 4  # P3, P4, P5, P6
+  
+  # Detection head
+  head: "retina_head"  # RetinaNet-style head
+  num_classes: 15
+  num_anchors: 9  # 3 aspect ratios × 3 scales
+  
+  # Training
+  device: "cuda"
+  mixed_precision: true  # Use AMP (fp16) for memory efficiency
+
+# ============================================================================
+# STUDENT MODEL CONFIGURATION
+# ============================================================================
+student:
+  backbone: "mobilenet_v2"  # Lightweight backbone
+  pretrained: true
+  fpn:
+    in_channels: [32, 64, 128, 256]  # MobileNetV2 output channels
+    out_channels: 128  # Lighter than teacher (256)
+    num_levels: 4
+  
+  head: "retina_head"
+  num_classes: 15
+  num_anchors: 9
+  
+  # Adapters for feature KD
+  adapters:
+    enabled: true
+    type: "deconv"  # Options: deconv, bilinear, learned_projection
+    hidden_dim: 256  # Hidden dimension in adapter modules
+  
+  device: "cuda"
+  mixed_precision: true
+
+# ============================================================================
+# TRAINING: PHASE 1 - TEACHER
+# ============================================================================
+training_teacher:
+  epochs: 50
+  batch_size: 4  # Larger BS for HR images → needs ~10GB VRAM
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  
+  # Optimizer
+  optimizer: "adam"  # adam, sgd
+  scheduler: "cosine"  # cosine, step
+  
+  # Data augmentation
+  augmentation:
+    horizontal_flip: true
+    vertical_flip: false
+    rotate: true
+    color_jitter: true
+  
+  # Logging
+  log_interval: 10  # Log every 10 batches
+  checkpoint_interval: 5  # Save checkpoint every 5 epochs
+  output_dir: "./checkpoints/teacher"
+  log_dir: "./logs/teacher"
+
+# ============================================================================
+# TRAINING: PHASE 2A - STUDENT (BASELINE, no KD)
+# ============================================================================
+training_student_baseline:
+  epochs: 50
+  batch_size: 16  # Can use larger BS for LR images (~3-4GB VRAM)
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  
+  optimizer: "adam"
+  scheduler: "cosine"
+  
+  augmentation:
+    horizontal_flip: true
+    vertical_flip: false
+    rotate: true
+    color_jitter: true
+  
+  log_interval: 10
+  checkpoint_interval: 5
+  output_dir: "./checkpoints/student_baseline"
+  log_dir: "./logs/student_baseline"
+
+# ============================================================================
+# TRAINING: PHASE 2B - STUDENT (WITH KD)
+# ============================================================================
+training_student_kd:
+  epochs: 50
+  batch_size: 8  # Reduced due to both models in memory
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  
+  optimizer: "adam"
+  scheduler: "cosine"
+  
+  # Knowledge distillation parameters
+  kd:
+    temperature: 4.0  # Softness of logit distributions
+    alpha: 1.0        # Weight for detection loss
+    beta: 0.5         # Weight for logit KD loss
+    gamma: 1.0        # Weight for feature KD loss
+  
+  augmentation:
+    horizontal_flip: true
+    vertical_flip: false
+    rotate: true
+    color_jitter: true
+  
+  # Teacher checkpoint to load
+  teacher_checkpoint: "./checkpoints/teacher/best_model.pth"
+  
+  log_interval: 10
+  checkpoint_interval: 5
+  output_dir: "./checkpoints/student_kd"
+  log_dir: "./logs/student_kd"
+
+# ============================================================================
+# EVALUATION CONFIGURATION
+# ============================================================================
+evaluation:
+  # Metrics
+  iou_threshold: 0.5
+  conf_threshold: 0.5
+  max_detections: 100
+  
+  # Output
+  output_dir: "./outputs/metrics"
+  save_predictions: true
+
+# ============================================================================
+# VISUALIZATION CONFIGURATION
+# ============================================================================
+visualization:
+  output_dir: "./outputs/visualizations"
+  num_samples: 10  # Visualize top 10 detections
+  show_teacher: true
+  show_student_baseline: true
+  show_student_kd: true
+  show_feature_maps: true

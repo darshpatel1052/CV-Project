@@ -1,0 +1,17 @@
+torch==2.1.0
+torchvision==0.16.0
+numpy>=1.25.0,<2.0
+Pillow==10.0.0
+matplotlib==3.8.0
+seaborn>=0.13.2
+tqdm==4.66.0
+opencv-python==4.8.0.74
+pyyaml==6.0
+scipy==1.11.0
+# Remote sensing specific
+# Note: rasterio supports GeoTIFF format (DOTA uses it)
+rasterio==1.3.8
+# For download/utilities
+requests==2.31.0
+# Validation
+tensorboard==2.14.0
