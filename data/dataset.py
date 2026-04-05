@@ -5,29 +5,11 @@ DOTA Dataset Loader for Object Detection
 Loads DOTA v1.0/v1.5 dataset with Object Detection annotations.
 Supports both high-resolution (1024×1024) and low-resolution (128×128) versions.
 
-DOTA Dataset Structure (v1.0 uses TIFF, v1.5 uses PNG):
-    DOTA_v1.0/ or raw-DOTA_v1.5/
-    ├── train/                          # Training set
-    │   ├── images/                     # Images (TIFF for v1.0, PNG for v1.5)
-    │   │   ├── P0000.tif (v1.0)
-    │   │   ├── P0000.png (v1.5)
-    │   │   └── ...
-    │   └── labelTxt/                   # Annotations (custom format)
-    │       ├── P0000.txt
-    │       └── ...
-    └── val/                            # Validation set
-        ├── images/
-        └── labelTxt/
-
-Annotation Format (labelTxt):
-    Header lines:
-        imagesource:GoogleEarth
-        gsd:0.146343590398
-    
-    Each object line: x1 y1 x2 y2 x3 y3 x4 y4 class difficulty
-    - 8 coordinates form an OBB (Oriented Bounding Box)
-    - class: plane, ship, storage-tank, ..., swimming-pool
-    - difficulty: 0 (easy), 1 (hard)
+Key fixes applied:
+  - Bounding boxes are properly scaled to match target image resolution
+  - ImageNet normalization applied (pretrained backbones expect it)
+  - Degenerate boxes (zero area) are filtered out
+  - Boxes are clipped to image bounds
 """
 
 import os
@@ -42,29 +24,31 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# ImageNet normalization constants (required for pretrained Swin-T / MobileNetV2)
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
 
 class DOTADetectionDataset(Dataset):
     """
     DOTA Object Detection Dataset (v1.0/v1.5).
-    
+
     Args:
-        data_root: Path to DOTA_v1.0 or raw-DOTA_v1.5 directory
+        data_root: Path to processed dataset directory
         split: 'train' or 'val'
         image_size: Target image size (1024 for teacher, 128 for student)
         subset_size: If not None, use only first N images (for testing)
         augmentation: Boolean to apply augmentations
-    
+
     Returns:
-        image: torch.Tensor of shape (3, H, W), values in [0, 1]
+        image: torch.Tensor of shape (3, H, W), ImageNet-normalized
         targets: Dict with keys:
-            - 'boxes': torch.Tensor of shape (num_objects, 4) in [x1, y1, x2, y2]
-            - 'labels': torch.Tensor of shape (num_objects,) with class IDs
+            - 'boxes': torch.Tensor of shape (num_objects, 4) in [x1, y1, x2, y2] (pixel coords in target resolution)
+            - 'labels': torch.Tensor of shape (num_objects,) with class IDs (0-indexed)
             - 'image_id': int, image index
             - 'filename': str, image filename
-    
-    Note: Automatically handles both v1.0 (TIFF) and v1.5 (PNG) formats.
     """
-    
+
     # DOTA class names (15 classes)
     CLASSES = [
         'plane',
@@ -83,7 +67,7 @@ class DOTADetectionDataset(Dataset):
         'soccer-ball-field',
         'swimming-pool'
     ]
-    
+
     def __init__(
         self,
         data_root: str,
@@ -97,73 +81,76 @@ class DOTADetectionDataset(Dataset):
         self.split = split
         self.image_size = image_size
         self.augmentation = augmentation
-        
+
         # Validate split
         if split not in ['train', 'val', 'test']:
             raise ValueError(f"split must be 'train', 'val', or 'test', got {split}")
-        
+
         # Create class name to ID mapping
         self.class_to_id = {name: idx for idx, name in enumerate(self.CLASSES)}
         self.id_to_class = {idx: name for idx, name in enumerate(self.CLASSES)}
-        
+
         # Determine resolution suffix (HR for >=512px, LR for <512px)
         resolution_suffix = 'hr' if image_size >= 512 else 'lr'
         split_dir = f"{split}_{resolution_suffix}"
-        
+
         # Build file list
         self.images_dir = os.path.join(data_root, split_dir, 'images')
         self.labels_dir = os.path.join(data_root, split_dir, 'labels')
-        
+
         # Get list of image files
         self.image_files = sorted([
             f for f in os.listdir(self.images_dir)
             if f.lower().endswith(('.tif', '.tiff', '.jpg', '.png'))
         ])
-        
+
         # Apply subset if specified
         if subset_size is not None:
             self.image_files = self.image_files[:subset_size]
-        
-        logger.info(f"Loaded {len(self.image_files)} images from {split} split")
+
+        logger.info(f"Loaded {len(self.image_files)} images from {split}_{resolution_suffix} split")
         if subset_size is not None:
             logger.info(f"  (using subset of {subset_size})")
-    
+
     def __len__(self) -> int:
         """Return dataset size."""
         return len(self.image_files)
-    
+
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict]:
         """
         Get single sample.
-        
-        Args:
-            idx: Image index
-        
+
         Returns:
-            image: torch.Tensor of shape (3, H, W)
+            image: torch.Tensor of shape (3, H, W), ImageNet-normalized
             targets: Dict with 'boxes', 'labels', 'image_id', 'filename'
         """
         # Load image
         image_file = self.image_files[idx]
         image_path = os.path.join(self.images_dir, image_file)
-        
-        # Read image (PIL for flexibility with various formats)
+
         try:
             image = Image.open(image_path).convert('RGB')
         except Exception as e:
             logger.error(f"Failed to load image {image_path}: {e}")
             raise
-        
+
+        # Get original image dimensions BEFORE resize
+        orig_w, orig_h = image.size  # PIL returns (width, height)
+
         # Resize to target size
         image = image.resize((self.image_size, self.image_size), Image.BILINEAR)
-        
+
+        # Compute scale factors for box coordinate transformation
+        scale_x = self.image_size / orig_w
+        scale_y = self.image_size / orig_h
+
         # Load annotations
         base_name = os.path.splitext(image_file)[0]
         label_path = os.path.join(self.labels_dir, f"{base_name}.txt")
-        
+
         boxes = []  # [x1, y1, x2, y2] (axis-aligned, after transformation)
         labels = []
-        
+
         if os.path.exists(label_path):
             with open(label_path, 'r') as f:
                 for line in f:
@@ -171,39 +158,52 @@ class DOTADetectionDataset(Dataset):
                     # Skip metadata lines (v1.5 includes these)
                     if not line or line.startswith('imagesource') or line.startswith('gsd:'):
                         continue
-                    
+
                     parts = line.split()
                     if len(parts) < 9:
                         continue
-                    
+
                     try:
                         # Parse OBB coordinates (8 values: x1,y1,x2,y2,x3,y3,x4,y4)
                         coords = [float(p) for p in parts[:8]]
                         class_name = parts[8]
                         # difficulty = int(parts[9]) if len(parts) > 9 else 0
-                        
+
                         # Convert OBB to axis-aligned bounding box
                         xs = [coords[0], coords[2], coords[4], coords[6]]
                         ys = [coords[1], coords[3], coords[5], coords[7]]
-                        
+
                         x_min, x_max = min(xs), max(xs)
                         y_min, y_max = min(ys), max(ys)
-                        
-                        # Normalize to [0, 1] based on original image (before resize)
-                        # Note: We'll scale when we resize the image
-                        boxes.append([x_min, y_min, x_max, y_max])
-                        
+
+                        # Scale coordinates to target resolution
+                        x_min = x_min * scale_x
+                        y_min = y_min * scale_y
+                        x_max = x_max * scale_x
+                        y_max = y_max * scale_y
+
+                        # Clip to image bounds
+                        x_min = max(0, min(x_min, self.image_size))
+                        y_min = max(0, min(y_min, self.image_size))
+                        x_max = max(0, min(x_max, self.image_size))
+                        y_max = max(0, min(y_max, self.image_size))
+
+                        # Filter degenerate boxes (zero or near-zero area)
+                        if (x_max - x_min) < 1 or (y_max - y_min) < 1:
+                            continue
+
                         # Get class ID
                         class_id = self.class_to_id.get(class_name, -1)
                         if class_id >= 0:
+                            boxes.append([x_min, y_min, x_max, y_max])
                             labels.append(class_id)
                         else:
                             logger.warning(f"Unknown class: {class_name}")
-                    
+
                     except (ValueError, IndexError) as e:
                         logger.warning(f"Failed to parse annotation line: {line}, Error: {e}")
                         continue
-        
+
         # Convert to numpy for coordinate transformation
         if len(boxes) > 0:
             boxes = np.array(boxes, dtype=np.float32)
@@ -211,19 +211,25 @@ class DOTADetectionDataset(Dataset):
         else:
             boxes = np.zeros((0, 4), dtype=np.float32)
             labels = np.zeros((0,), dtype=np.int64)
-        
+
         # Apply augmentations if requested
-        if self.augmentation:
+        if self.augmentation and len(boxes) > 0:
             image, boxes = self._apply_augmentations(image, boxes)
-        
-        # Convert image to tensor
-        image_np = np.array(image, dtype=np.float32) / 255.0  # Normalize to [0, 1]
+
+        # Convert image to tensor with ImageNet normalization
+        image_np = np.array(image, dtype=np.float32) / 255.0  # Scale to [0, 1]
+
+        # Apply ImageNet normalization (required for pretrained backbones)
+        mean = np.array(IMAGENET_MEAN, dtype=np.float32).reshape(1, 1, 3)
+        std = np.array(IMAGENET_STD, dtype=np.float32).reshape(1, 1, 3)
+        image_np = (image_np - mean) / std
+
         image_tensor = torch.from_numpy(image_np).permute(2, 0, 1)  # (3, H, W)
-        
+
         # Convert boxes to tensor
-        boxes_tensor = torch.from_numpy(boxes)
-        labels_tensor = torch.from_numpy(labels)
-        
+        boxes_tensor = torch.from_numpy(boxes).float()
+        labels_tensor = torch.from_numpy(labels).long()
+
         # Create targets dict
         targets = {
             'boxes': boxes_tensor,
@@ -231,60 +237,57 @@ class DOTADetectionDataset(Dataset):
             'image_id': idx,
             'filename': image_file,
         }
-        
+
         return image_tensor, targets
-    
+
     def _apply_augmentations(self, image: Image.Image, boxes: np.ndarray) -> Tuple[Image.Image, np.ndarray]:
         """
         Apply data augmentations to image and boxes.
-        
+
         Args:
             image: PIL Image
-            boxes: Bounding boxes in [x1, y1, x2, y2] format
-        
+            boxes: Bounding boxes in [x1, y1, x2, y2] format, already in target resolution
+
         Returns:
             augmented_image: PIL Image
             augmented_boxes: Augmented boxes
         """
         image_np = np.array(image)
-        
+
         # Random horizontal flip
         if np.random.rand() < 0.5:
-            image_np = np.fliplr(image_np)
-            boxes[:, [0, 2]] = image_np.shape[1] - boxes[:, [2, 0]]
-        
-        # Random color jitter
+            image_np = np.fliplr(image_np).copy()
+            w = image_np.shape[1]
+            boxes_flipped = boxes.copy()
+            boxes_flipped[:, 0] = w - boxes[:, 2]
+            boxes_flipped[:, 2] = w - boxes[:, 0]
+            boxes = boxes_flipped
+
+        # Random color jitter (brightness)
         if np.random.rand() < 0.5:
             brightness = np.random.uniform(0.8, 1.2)
             image_np = np.clip(image_np * brightness, 0, 255).astype(np.uint8)
-        
+
         image = Image.fromarray(image_np)
         return image, boxes
-    
-    def collate_fn(self, batch: List[Tuple]) -> Tuple[torch.Tensor, Dict]:
+
+    def collate_fn(self, batch: List[Tuple]) -> Tuple[torch.Tensor, List[Dict]]:
         """
         Custom collate function for DataLoader.
-        
+
         Since images might have varied number of objects,
         we return batched images and a list of target dicts.
-        
-        Args:
-            batch: List of (image, targets) tuples
-        
-        Returns:
-            images: torch.Tensor of shape (B, 3, H, W)
-            targets_list: List of target dicts
         """
         images = []
         targets_list = []
-        
+
         for image, targets in batch:
             images.append(image)
             targets_list.append(targets)
-        
+
         # Stack images into batch
         images_batch = torch.stack(images, dim=0)
-        
+
         return images_batch, targets_list
 
 
@@ -298,22 +301,7 @@ def get_dota_dataloader(
     augmentation: bool = False,
     shuffle: bool = True
 ) -> DataLoader:
-    """
-    Create DataLoader for DOTA dataset.
-    
-    Args:
-        data_root: Path to DOTA_v1.0 directory
-        split: 'train' or 'val'
-        image_size: Target image size
-        batch_size: Batch size
-        num_workers: Number of data loading workers
-        subset_size: Limit dataset size (for testing)
-        augmentation: Apply augmentations
-        shuffle: Shuffle dataset
-    
-    Returns:
-        DataLoader instance
-    """
+    """Create DataLoader for DOTA dataset."""
     dataset = DOTADetectionDataset(
         data_root=data_root,
         split=split,
@@ -321,7 +309,7 @@ def get_dota_dataloader(
         subset_size=subset_size,
         augmentation=augmentation
     )
-    
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
@@ -329,121 +317,27 @@ def get_dota_dataloader(
         num_workers=num_workers,
         collate_fn=dataset.collate_fn
     )
-    
+
     return dataloader
 
 
-# ============================================================================
-# TESTING & UTILITIES
-# ============================================================================
-
-def visualize_dataset_sample(
-    dataloader: DataLoader,
-    num_samples: int = 3,
-    output_dir: Optional[str] = None
-):
-    """
-    Visualize dataset samples with bounding boxes.
-    
-    Args:
-        dataloader: DataLoader instance
-        num_samples: Number of samples to visualize
-        output_dir: If provided, save visualizations to this directory
-    """
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
-    
-    for batch_idx, (images, targets_list) in enumerate(dataloader):
-        for sample_idx in range(min(len(images), num_samples)):
-            image = images[sample_idx]  # (3, H, W), [0, 1]
-            targets = targets_list[sample_idx]
-            
-            # Convert to numpy for visualization
-            image_np = image.numpy().transpose(1, 2, 0)  # (H, W, 3)
-            
-            # Create figure
-            fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-            ax.imshow(image_np)
-            
-            # Draw bounding boxes
-            boxes = targets['boxes']
-            labels = targets['labels']
-            
-            for box, label in zip(boxes, labels):
-                x1, y1, x2, y2 = box.numpy()
-                w = x2 - x1
-                h = y2 - y1
-                
-                rect = patches.Rectangle(
-                    (x1, y1), w, h,
-                    linewidth=2,
-                    edgecolor='r',
-                    facecolor='none'
-                )
-                ax.add_patch(rect)
-                
-                # Add class label
-                class_name = DOTADetectionDataset.CLASSES[label]
-                ax.text(x1, y1-5, class_name, fontsize=10, color='red')
-            
-            ax.set_title(f"Image {targets['filename']} ({len(boxes)} objects)")
-            ax.axis('off')
-            
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                save_path = os.path.join(output_dir, f"sample_{batch_idx}_{sample_idx}.png")
-                plt.savefig(save_path, dpi=100, bbox_inches='tight')
-                print(f"Saved to {save_path}")
-            else:
-                plt.show()
-            
-            plt.close()
-
-
 if __name__ == "__main__":
-    # Example usage and testing
-    print("DOTA Dataset Module")
+    # Quick self-test
+    print("DOTA Dataset Module — Self-Test")
     print("=" * 50)
-    
-    # Note: Set these to your actual paths
-    data_root = "./datasets/raw/DOTA_v1.0"
-    
-    if os.path.exists(data_root):
-        print(f"\nLoading dataset from: {data_root}")
-        
-        # Create dataloader
-        dataloader = get_dota_dataloader(
-            data_root=data_root,
-            split='train',
-            image_size=1024,
-            batch_size=2,
-            subset_size=5,
-            augmentation=False
-        )
-        
-        print(f"Dataset size: {len(dataloader.dataset)}")
-        
-        # Get one batch
-        images, targets_list = next(iter(dataloader))
-        print(f"Batch shape: {images.shape}")
-        print(f"Number of targets: {len(targets_list)}")
-        
-        for i, targets in enumerate(targets_list):
-            print(f"  Sample {i}: {targets['boxes'].shape[0]} objects")
-        
-        # Visualize
-        print("\nVisualizing samples...")
-        visualize_dataset_sample(dataloader, num_samples=2)
+
+    data_root = "./datasets/processed"
+
+    if os.path.exists(os.path.join(data_root, 'train_hr')):
+        ds = DOTADetectionDataset(data_root, 'train', 1024, subset_size=3)
+        img, tgt = ds[0]
+        print(f"Image shape: {img.shape}, dtype: {img.dtype}")
+        print(f"Boxes: {tgt['boxes'].shape}, Labels: {tgt['labels'].shape}")
+        if len(tgt['boxes']) > 0:
+            print(f"First box: {tgt['boxes'][0]}")
+            assert (tgt['boxes'][:, 2] <= 1024).all(), "x2 exceeds image width!"
+            assert (tgt['boxes'][:, 3] <= 1024).all(), "y2 exceeds image height!"
+            print("✓ Box coordinates are within image bounds")
+        print("✓ Dataset self-test passed")
     else:
-        print(f"ERROR: Dataset not found at {data_root}")
-        print("\nTo set up the dataset:")
-        print("1. Download DOTA v1.0 from http://captain.whu.edu.cn/DiRS")
-        print("2. Extract to ./datasets/raw/DOTA_v1.0")
-        print("3. Expected structure:")
-        print("   DOTA_v1.0/")
-        print("   ├── train/")
-        print("   │   ├── images/")
-        print("   │   └── labelTxt/")
-        print("   └── val/")
-        print("       ├── images/")
-        print("       └── labelTxt/")
+        print(f"Dataset not found at {data_root}")

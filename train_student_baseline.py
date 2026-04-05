@@ -2,13 +2,8 @@
 Student Baseline Training (Phase 2a)
 ====================================
 
-Train a lightweight MobileNetV2-based student detector on LOW-RESOLUTION (128×128) images
-WITHOUT knowledge distillation. This baseline establishes a lower-bound performance and 
-serves as the starting model before Phase 2b applies KD.
-
-The student learns purely from detection loss (Focal + SmoothL1), just like the teacher.
-In Phase 2b, we freeze the teacher and add KD losses (logit + feature alignment) to boost
-the student's accuracy toward the teacher's level.
+Train a lightweight MobileNetV2-based student detector on LR (128×128) images
+WITHOUT knowledge distillation. Uses proper anchor matching and real detection loss.
 """
 
 import os
@@ -18,26 +13,22 @@ import argparse
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from utils import load_config, setup_logger
+from utils import (
+    load_config, setup_logger, generate_all_anchors,
+    match_anchors_to_targets, postprocess_detections, compute_map
+)
 from data.dataset import DOTADetectionDataset
 from models.student import StudentDetector
-
-try:
-    from losses.detection_loss import FocalLoss
-    FocalLoss_available = True
-except ImportError:
-    FocalLoss_available = False
+from losses.detection_loss import FocalLoss, SmoothL1Loss
+from train_teacher import compute_detection_loss, validate
 
 
 def collate_fn(batch):
-    """Collate function for DataLoader to handle variable-length detections."""
+    """Collate function for variable-length detections."""
     return tuple(zip(*batch))
 
 
 def main():
-    # =========================================================================
-    # SETUP
-    # =========================================================================
     parser = argparse.ArgumentParser(description="Train Student Detector (Baseline, no KD)")
     parser.add_argument('--config', type=str, default='configs/config.yaml')
     parser.add_argument('--epochs', type=int, default=None)
@@ -45,178 +36,191 @@ def main():
     args = parser.parse_args()
 
     cfg = load_config(args.config)
-    
     epochs = args.epochs if args.epochs else cfg['training_student_baseline']['epochs']
     subset_size = args.subset if args.subset else cfg['dataset'].get('subset_size', None)
-    
-    logger = setup_logger("StudentBaseline")
-    logger.info("🎓 Starting Student Baseline Training (no KD)...")
-    logger.info(f"Training for {epochs} epochs on LOW-RESOLUTION images (128×128)")
 
-    device = torch.device(cfg['training_student_baseline'].get('device', 'cuda') 
-                         if torch.cuda.is_available() else 'cpu')
+    logger = setup_logger("StudentBaseline")
+    logger.info("Starting Student Baseline Training (no KD)")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
-    
+
     torch.manual_seed(cfg['seed'])
     if device.type == 'cuda':
         torch.cuda.manual_seed_all(cfg['seed'])
 
+    num_classes = cfg['dataset']['num_classes']
+    image_size = cfg['dataset']['student_resolution']  # 128
+
     # =========================================================================
-    # DATA LOADING
+    # DATA
     # =========================================================================
-    logger.info("📦 Loading Low-Resolution DOTA Dataset...")
-    
     train_dataset = DOTADetectionDataset(
         data_root=cfg['dataset']['processed_data_path'],
-        split=cfg['dataset']['split'],
-        image_size=cfg['dataset']['student_resolution'],  # 128×128
-        subset_size=subset_size,
-        augmentation=True
+        split='train', image_size=image_size,
+        subset_size=subset_size, augmentation=True
     )
-
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg['training_student_baseline']['batch_size'],
-        shuffle=True,
-        num_workers=0,  # Set to 0 for Windows compatibility with multiprocessing
-        collate_fn=collate_fn
+        train_dataset, batch_size=cfg['training_student_baseline']['batch_size'],
+        shuffle=True, num_workers=2, collate_fn=collate_fn, pin_memory=True
     )
-    logger.info(f"Loaded {len(train_dataset)} images in {len(train_loader)} batches.")
+
+    val_subset = min(200, subset_size) if subset_size else 200
+    val_dataset = DOTADetectionDataset(
+        data_root=cfg['dataset']['processed_data_path'],
+        split='val', image_size=image_size,
+        subset_size=val_subset, augmentation=False
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=max(1, cfg['training_student_baseline']['batch_size'] // 2),
+        shuffle=False, num_workers=2, collate_fn=collate_fn, pin_memory=True
+    )
+    logger.info(f"Train: {len(train_dataset)} images, Val: {len(val_dataset)} images")
 
     # =========================================================================
-    # MODEL & OPTIMIZER
+    # MODEL & ANCHORS
     # =========================================================================
-    logger.info("🧠 Initializing Student Model (MobileNetV2 + FPN)...")
-    
-    model = StudentDetector(
-        num_classes=cfg['dataset']['num_classes'],
-        pretrained=cfg['student']['pretrained']
-    )
+    model = StudentDetector(num_classes=num_classes, pretrained=cfg['student']['pretrained'])
     model = model.to(device)
 
+    # The student's detection head runs on adapted_features (upsampled 4×).
+    # So the effective spatial sizes are same as if the input were 4× larger.
+    # For 128 input: adapted P3..P6 sizes are [128, 64, 32, 16] (same shape as teacher on 1024).
+    # But anchors need to be relative to the ORIGINAL 128×128 image, not the adapted feature space.
+    # Let's determine the actual FPN strides by running a dummy forward pass.
+
+    with torch.no_grad():
+        dummy = torch.randn(1, 3, image_size, image_size, device=device)
+        dummy_out = model(dummy)
+        # The student head runs on adapted_features, which are upsampled versions.
+        # But cls_logits is produced from these adapted features.
+        # adapted_features sizes correspond to teacher's FPN sizes (for 1024 input).
+        # The number of anchors from adapted features = same as teacher.
+        # But our image is only 128×128, so anchors at teacher scale don't make sense.
+        # The RIGHT approach: generate anchors matching the ADAPTED feature map sizes,
+        # but scale them to the 128×128 image space.
+        adapted_sizes = [f.shape[-1] for f in dummy_out['adapted_features']]
+        total_anchors_model = dummy_out['cls_logits'].shape[1]
+        num_cls_output = dummy_out['cls_logits'].shape[2]
+        logger.info(f"Adapted feature map sizes: {adapted_sizes}")
+        logger.info(f"Total anchors: {total_anchors_model}, Cls channels: {num_cls_output}")
+
+    # Compute strides relative to the student's image size
+    # adapted_sizes come from upsampling the native FPN features 4×.
+    # For the student: native FPN produces P3..P6 at sizes [16,8,4,2] for 128 input.
+    # After 4× upsampling: [64,32,16,8]. But the anchors should tile the 128×128 image.
+    # So stride = 128 / adapted_size for each level.
+    fpn_strides = [image_size // s for s in adapted_sizes]
+    logger.info(f"Student FPN strides (on adapted features): {fpn_strides}")
+
+    anchors = generate_all_anchors(image_size, fpn_strides, base_sizes=[s * 4 for s in fpn_strides])
+    logger.info(f"Generated {anchors.shape[0]} anchors (model expects {total_anchors_model})")
+    assert anchors.shape[0] == total_anchors_model, \
+        f"Anchor count mismatch: {anchors.shape[0]} vs {total_anchors_model}"
+
+    # =========================================================================
+    # OPTIMIZER & LOSS
+    # =========================================================================
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg['training_student_baseline']['learning_rate'],
         weight_decay=cfg['training_student_baseline']['weight_decay']
     )
-    
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg['student']['mixed_precision'])
-    
-    # Learning Rate Scheduler with Warmup
+
+    use_amp = cfg['student'].get('mixed_precision', True) and device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
     total_iters = len(train_loader) * epochs
     warmup_iters = len(train_loader) * cfg['training_student_baseline'].get('warmup_epochs', 5)
-    
+
     def lr_lambda(current_iter):
         if current_iter < warmup_iters:
             return float(current_iter) / float(max(1, warmup_iters))
+        import math
         progress = float(current_iter - warmup_iters) / float(max(1, total_iters - warmup_iters))
-        return max(0.1, 0.5 * (1.0 + torch.cos(torch.tensor(torch.pi * progress))))
-    
+        return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    # Loss Functions
-    if FocalLoss_available:
-        focal_loss_fn = FocalLoss(alpha=0.25, gamma=2.0)
-    else:
-        focal_loss_fn = nn.CrossEntropyLoss()
-    
-    bbox_loss_fn = nn.SmoothL1Loss(reduction='mean', beta=1.0)
+    focal_loss_fn = FocalLoss(alpha=0.25, gamma=2.0)
+    bbox_loss_fn = SmoothL1Loss(beta=1.0 / 9.0)
 
-    # Directories
     checkpoint_dir = cfg['training_student_baseline'].get('output_dir', './checkpoints/student_baseline')
-    log_dir = cfg['training_student_baseline'].get('log_dir', './logs/student_baseline')
     os.makedirs(checkpoint_dir, exist_ok=True)
-    os.makedirs(log_dir, exist_ok=True)
 
     # =========================================================================
     # TRAINING LOOP
     # =========================================================================
-    logger.info("🔥 Starting Training...")
-    
-    best_loss = float('inf')
-    
+    logger.info(f"Starting training for {epochs} epochs...")
+    best_map = 0.0
+
     for epoch in range(epochs):
         model.train()
         epoch_loss = 0.0
-        
+        num_batches = 0
+
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}")
-        
-        for batch_idx, (images, targets) in enumerate(pbar):
+
+        for images, targets in pbar:
             images = torch.stack(images).to(device)
-            targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v 
-                       for k, v in t.items()} for t in targets]
+            targets_list = [{k: v.to(device) if isinstance(v, torch.Tensor) else v
+                            for k, v in t.items()} for t in targets]
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast(enabled=cfg['student']['mixed_precision']):
-                # Forward pass. The head runs on adapted_features internally.
+            with torch.amp.autocast('cuda', enabled=use_amp):
                 outputs = model(images)
-                
-                cls_logits = outputs['cls_logits']
-                bbox_regs = outputs['bbox_regs']
-                
-                # Compute detection loss from flattened predictions
-                try:
-                    if cls_logits.dim() > 2:
-                        cls_pred_flat = cls_logits.view(-1, cls_logits.shape[-1])
-                    else:
-                        cls_pred_flat = cls_logits
-                    
-                    if bbox_regs.dim() > 2:
-                        bbox_pred_flat = bbox_regs.view(-1, 4)
-                    else:
-                        bbox_pred_flat = bbox_regs
-                    
-                    num_anchors = cls_pred_flat.shape[0]
-                    dummy_cls_targets = torch.zeros(num_anchors, dtype=torch.long, device=device)
-                    dummy_bbox_targets = torch.zeros(num_anchors, 4, device=device)
-                    
-                    cls_loss = focal_loss_fn(cls_pred_flat, dummy_cls_targets)
-                    bbox_loss = bbox_loss_fn(bbox_pred_flat, dummy_bbox_targets)
-                    loss = cls_loss + bbox_loss
-                    
-                except Exception as e:
-                    logger.warning(f"Loss computation error: {e}")
-                    loss = torch.tensor(1.0, requires_grad=True, device=device)
+                loss_cls, loss_reg = compute_detection_loss(
+                    outputs['cls_logits'], outputs['bbox_regs'],
+                    anchors, targets_list, device,
+                    focal_loss_fn, bbox_loss_fn, num_classes
+                )
+                loss = loss_cls + loss_reg
 
             scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
 
             epoch_loss += loss.item()
+            num_batches += 1
             pbar.set_postfix({
-                'loss': f"{loss.item():.4f}",
+                'cls': f"{loss_cls.item():.4f}",
+                'reg': f"{loss_reg.item():.4f}",
                 'lr': f"{optimizer.param_groups[0]['lr']:.2e}"
             })
 
-        avg_loss = epoch_loss / len(train_loader)
-        logger.info(f"✅ Epoch {epoch+1}/{epochs} | Avg Loss: {avg_loss:.4f}")
+        avg_loss = epoch_loss / num_batches
+        logger.info(f"Epoch {epoch+1}/{epochs} | Avg Loss: {avg_loss:.4f}")
 
-        # Save checkpoints
+        # Validation and checkpointing
         checkpoint_interval = cfg['training_student_baseline'].get('checkpoint_interval', 5)
         if (epoch + 1) % checkpoint_interval == 0 or (epoch + 1) == epochs:
-            checkpoint_path = os.path.join(checkpoint_dir, f"student_baseline_epoch_{epoch+1}.pth")
+            logger.info("Running validation...")
+            mAP, _ = validate(model, val_loader, anchors, device, num_classes)
+            logger.info(f"Val mAP@0.5: {mAP:.4f}")
+
+            ckpt_path = os.path.join(checkpoint_dir, f"student_baseline_epoch_{epoch+1}.pth")
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': avg_loss,
-            }, checkpoint_path)
-            logger.info(f"💾 Saved checkpoint: {checkpoint_path}")
-        
-        # Save best model
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            best_path = os.path.join(checkpoint_dir, "best_model.pth")
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'loss': avg_loss,
-            }, best_path)
-            logger.info(f"🌟 New best model! Loss: {best_loss:.4f}")
+                'loss': avg_loss, 'mAP': mAP,
+            }, ckpt_path)
 
-    logger.info("🎉 Student baseline training complete!")
+            if mAP > best_map:
+                best_map = mAP
+                best_path = os.path.join(checkpoint_dir, "best_model.pth")
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'loss': avg_loss, 'mAP': mAP,
+                }, best_path)
+                logger.info(f"New best model! mAP: {best_map:.4f}")
+
+    logger.info(f"Student baseline training complete! Best mAP: {best_map:.4f}")
 
 
 if __name__ == '__main__':

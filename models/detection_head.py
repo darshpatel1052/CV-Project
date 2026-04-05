@@ -214,14 +214,19 @@ class RetinaNetHead(nn.Module):
         self._init_prior_prob()
     
     def _init_prior_prob(self):
-        """Initialize classification output with prior probability."""
-        # Formula: logit = log(p / (1-p))
-        # For prior_prob=0.01: logit = log(0.01/0.99) ≈ -4.6
-        # Initialize class sub-network's final layer bias
+        """Initialize classification output with prior probability and normal weights."""
+        # Initialize all conv layers
+        for module in self.modules():
+            if isinstance(module, nn.Conv2d):
+                # Standard RetinaNet init: small random weights
+                nn.init.normal_(module.weight, mean=0, std=0.01)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+                    
+        # Override classification final layer bias with prior prob
+        # Formula: logit = log(p / (1-p)) -> log(0.01/0.99) ≈ -4.595
         for module in self.cls_subnet.modules():
             if isinstance(module, nn.Conv2d) and module.out_channels == self.num_anchors * self.num_classes:
-                # Initialize bias with negative values to represent low confidence initially
-                # This helps with focal loss early training (prevents log(0) issues)
                 nn.init.constant_(module.bias, -4.595)
     
     def forward(

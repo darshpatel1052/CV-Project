@@ -92,8 +92,8 @@ student:
 # ============================================================================
 training_teacher:
   epochs: 50
-  batch_size: 4  # Larger BS for HR images → needs ~10GB VRAM
-  learning_rate: 0.001
+  batch_size: 2  # Larger BS for HR images → needs ~10GB VRAM
+  learning_rate: 0.0001
   weight_decay: 0.0001
   warmup_epochs: 5
   
@@ -119,8 +119,8 @@ training_teacher:
 # ============================================================================
 training_student_baseline:
   epochs: 50
-  batch_size: 16  # Can use larger BS for LR images (~3-4GB VRAM)
-  learning_rate: 0.001
+  batch_size: 8  # Can use larger BS for LR images (~3-4GB VRAM)
+  learning_rate: 0.0005
   weight_decay: 0.0001
   warmup_epochs: 5
   
@@ -134,7 +134,7 @@ training_student_baseline:
     color_jitter: true
   
   log_interval: 10
-  checkpoint_interval: 5
+  checkpoint_interval: 25
   output_dir: "./checkpoints/student_baseline"
   log_dir: "./logs/student_baseline"
 
@@ -143,8 +143,8 @@ training_student_baseline:
 # ============================================================================
 training_student_kd:
   epochs: 50
-  batch_size: 8  # Reduced due to both models in memory
-  learning_rate: 0.001
+  batch_size: 4  # Reduced due to both models in memory
+  learning_rate: 0.0005
   weight_decay: 0.0001
   warmup_epochs: 5
   
@@ -168,7 +168,7 @@ training_student_kd:
   teacher_checkpoint: "./checkpoints/teacher/best_model.pth"
   
   log_interval: 10
-  checkpoint_interval: 5
+  checkpoint_interval: 25
   output_dir: "./checkpoints/student_kd"
   log_dir: "./logs/student_kd"
 
