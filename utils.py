@@ -169,23 +169,8 @@ def compute_iou_torch(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tenso
     Returns:
         iou: (N, M) tensor
     """
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])  # (N,)
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])  # (M,)
-
-    # Intersection
-    x1_inter = torch.max(boxes1[:, 0:1], boxes2[:, 0].unsqueeze(0))  # (N, M)
-    y1_inter = torch.max(boxes1[:, 1:2], boxes2[:, 1].unsqueeze(0))
-    x2_inter = torch.min(boxes1[:, 2:3], boxes2[:, 2].unsqueeze(0))
-    y2_inter = torch.min(boxes1[:, 3:4], boxes2[:, 3].unsqueeze(0))
-
-    inter_w = (x2_inter - x1_inter).clamp(min=0)
-    inter_h = (y2_inter - y1_inter).clamp(min=0)
-    inter_area = inter_w * inter_h  # (N, M)
-
-    union_area = area1[:, None] + area2[None, :] - inter_area
-    iou = inter_area / (union_area + 1e-6)
-    return iou
-
+    import torchvision.ops
+    return torchvision.ops.box_iou(boxes1, boxes2)
 
 def match_anchors_to_targets(
     anchors: torch.Tensor,
@@ -233,14 +218,34 @@ def match_anchors_to_targets(
         neg_mask = torch.ones(num_anchors, dtype=torch.bool, device=device)
         return cls_targets, reg_targets, pos_mask, neg_mask
 
-    # Compute IoU between all anchors and all GT boxes
-    iou_matrix = compute_iou_torch(anchors, gt_boxes)  # (N, M)
-
-    # For each anchor, find best matching GT
-    max_iou_per_anchor, best_gt_per_anchor = iou_matrix.max(dim=1)  # (N,), (N,)
-
-    # For each GT, find best matching anchor (ensures every GT gets at least one anchor)
-    max_iou_per_gt, best_anchor_per_gt = iou_matrix.max(dim=0)  # (M,), (M,)
+    # Memory stringency: Compute chunked IoU directly mapping 195k anchors to ~1000 targets
+    # without explicitly fully instantiating the N x M tensor.
+    import torchvision.ops
+    chunk_size = 20000
+    
+    max_iou_per_anchor = torch.full((num_anchors,), -1.0, dtype=torch.float32, device=device)
+    best_gt_per_anchor = torch.zeros((num_anchors,), dtype=torch.long, device=device)
+    
+    max_iou_per_gt = torch.full((gt_boxes.shape[0],), -1.0, dtype=torch.float32, device=device)
+    best_anchor_per_gt = torch.zeros((gt_boxes.shape[0],), dtype=torch.long, device=device)
+    
+    for i in range(0, num_anchors, chunk_size):
+        end = min(i + chunk_size, num_anchors)
+        # iou_chunk: [chunk_size, M]
+        iou_chunk = torchvision.ops.box_iou(anchors[i:end], gt_boxes)
+        
+        # Max IoU per anchor within this chunk
+        chunk_max_iou_a, chunk_best_gt_a = iou_chunk.max(dim=1)
+        max_iou_per_anchor[i:end] = chunk_max_iou_a
+        best_gt_per_anchor[i:end] = chunk_best_gt_a
+        
+        # Max IoU per GT within this chunk
+        chunk_max_iou_g, chunk_best_anchor_g = iou_chunk.max(dim=0)
+        
+        # Update global max per GT
+        update_mask = chunk_max_iou_g > max_iou_per_gt
+        max_iou_per_gt[update_mask] = chunk_max_iou_g[update_mask]
+        best_anchor_per_gt[update_mask] = chunk_best_anchor_g[update_mask] + i
 
     # 1. Negative anchors: max IoU < neg_iou_thresh
     neg_mask = max_iou_per_anchor < neg_iou_thresh
@@ -307,7 +312,9 @@ def encode_boxes(anchors: torch.Tensor, gt_boxes: torch.Tensor) -> torch.Tensor:
     return torch.stack([dx, dy, dw, dh], dim=1)
 
 
-def decode_boxes(anchors: torch.Tensor, deltas: torch.Tensor) -> torch.Tensor:
+def decode_boxes(
+    deltas: torch.Tensor, anchors: torch.Tensor, num_classes: int = 16
+) -> torch.Tensor:
     """
     Decode regression deltas back to boxes.
 
@@ -400,7 +407,7 @@ def postprocess_detections(
     bbox_regs: torch.Tensor,
     anchors: torch.Tensor,
     image_size: int,
-    num_classes: int = 15,
+    num_classes: int = 16,
     conf_threshold: float = 0.05,
     nms_threshold: float = 0.5,
     max_detections: int = 100,
@@ -522,9 +529,9 @@ def compute_ap_voc(recalls: np.ndarray, precisions: np.ndarray) -> float:
 
 
 def compute_map(
-    all_predictions: List[Dict],
-    all_targets: List[Dict],
-    num_classes: int = 15,
+    predictions: List[Dict[str, torch.Tensor]],
+    targets: List[Dict[str, torch.Tensor]],
+    num_classes: int = 16,
     iou_threshold: float = 0.5,
 ) -> Tuple[float, Dict[int, float]]:
     """
@@ -552,7 +559,7 @@ def compute_map(
         num_gt = 0
         gt_matched_by_image = {}  # image_id -> set of matched GT indices
 
-        for img_idx, (preds, gts) in enumerate(zip(all_predictions, all_targets)):
+        for img_idx, (preds, gts) in enumerate(zip(predictions, targets)):
             # GT for this class
             gt_labels = gts['labels']
             gt_mask = gt_labels == cls_id
@@ -591,7 +598,7 @@ def compute_map(
             pred_box = pred_boxes_all[pred_idx]
 
             # Get GT boxes for this class in this image
-            gts = all_targets[img_idx]
+            gts = targets[img_idx]
             gt_labels = gts['labels'].cpu().numpy()
             gt_boxes = gts['boxes'].cpu().numpy()
             gt_cls_mask = gt_labels == cls_id

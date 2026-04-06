@@ -49,7 +49,7 @@ class StudentDetector(nn.Module):
         pretrained (bool): Whether to load ImageNet pre-trained weights for MobileNetV2.
     """
     
-    def __init__(self, num_classes: int = 15, pretrained: bool = True):
+    def __init__(self, num_classes: int = 16, pretrained: bool = True):
         super().__init__()
         
         # =========================================================================
@@ -165,7 +165,7 @@ if __name__ == "__main__":
     
     try:
         print("Initializing Student Model (Pretrained=False for speed)...")
-        model = StudentDetector(num_classes=15, pretrained=False)
+        model = StudentDetector(num_classes=16, pretrained=False)
         model.eval()
         
         # Simulated DOTA 128x128 Low-Resolution Drone Image Extract

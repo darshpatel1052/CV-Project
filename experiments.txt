@@ -1,0 +1,247 @@
+================================================================================
+  RESOLUTION-AGNOSTIC KNOWLEDGE DISTILLATION FOR REMOTE SENSING
+  MASTER EXPERIMENT PLAN
+================================================================================
+
+PROJECT FRAMING
+===============
+This project investigates whether knowledge distillation (KD) can effectively
+transfer detection capability from a high-capacity teacher (Swin-T, 1024×1024)
+to a lightweight student (MobileNetV2, 128×128) for aerial object detection.
+
+The key novelty is the resolution-agnostic spatial projection adapters that
+bridge BOTH the channel AND spatial resolution gap between teacher and student
+feature representations. Unlike standard KD which assumes same-resolution
+inputs, our adapters must perform semantic translation between fundamentally
+different representational spaces (different receptive fields, different
+information density).
+
+CRITICAL DESIGN DECISION: OBB vs AABB
+--------------------------------------
+DOTA provides Oriented Bounding Box (OBB) annotations. We use Axis-Aligned
+Bounding Boxes (AABB) derived from OBB for the following reasons:
+
+1. Our focus is on KD methodology, not state-of-the-art OBB detection
+2. AABB detection is a valid detection paradigm (used in COCO, VOC, etc.)
+3. OBB IoU/NMS adds significant implementation complexity orthogonal to KD
+4. We provide OBB-aware IoU and NMS implementations for future extension
+5. Results are reported as "AABB-mAP" and are NOT comparable to published
+   OBB-mAP numbers from rotated detectors (e.g., R-DINO, LSKNet)
+
+We include OBB IoU + OBB NMS modules for completeness and potential
+extension, but the primary experiments use AABB evaluation.
+
+
+================================================================================
+PHASE 0: DATA PREPARATION & VERIFICATION
+================================================================================
+
+[EXP-0.1] Dataset Preparation
+  - Extract 1024×1024 patches from raw DOTA images (sliding window, 20% overlap)
+  - Generate HR (1024×1024) and LR (128×128) paired patches
+  - Save OBB annotations in patch-local coordinates
+  - TARGET: Use FULL training set (~2800 raw images → ~10k-15k patches)
+  - If compute-constrained: use ALL patches but reduce epochs, NOT subset size
+  STATUS: [  ]
+
+[EXP-0.2] Ground Truth Visualization Verification ← CRITICAL
+  - Run: python verify_data.py --num_samples 20
+  - Visually verify that GT boxes align with objects on HR patches
+  - Visually verify that GT boxes align with objects on LR patches
+  - Check coordinate scaling between HR ↔ LR is correct
+  - Detect any off-by-one errors in patch extraction
+  STATUS: [  ]
+
+[EXP-0.3] Dataset Statistics
+  - Report: total images, patches per resolution, objects per class
+  - Report: object size distribution (small/medium/large)
+  - Report: aspect ratio distribution (validates AABB approximation quality)
+  STATUS: [  ]
+
+
+================================================================================
+PHASE 1: TEACHER TRAINING
+================================================================================
+
+[EXP-1.1] Teacher Training (Swin-T + FPN + RetinaNet, 1024×1024)
+  - Backbone: Swin-T (ImageNet pretrained)
+  - FPN: 4 levels (P3-P6), 256 channels
+  - Head: RetinaNet with Focal Loss + Smooth L1
+  - Epochs: 50, LR: 1e-4, Cosine schedule with 5-epoch warmup
+  - Expected: mAP@0.5 ≈ 0.25-0.40 (AABB, not OBB)
+  - Run: python train_teacher.py --config configs/config.yaml
+  STATUS: [  ]
+
+
+================================================================================
+PHASE 2: BASELINE EXPERIMENTS (5 configurations)
+================================================================================
+
+[EXP-2.1] Student Baseline (MobileNetV2, 128×128, no KD)
+  - Standard training on LR images only
+  - No teacher involvement, no KD losses
+  - This is the LOWER BOUND for KD performance
+  - Run: python train_student_baseline.py
+  STATUS: [  ]
+
+[EXP-2.2] Student on HR (MobileNetV2, 1024×1024, no KD) ← NEW BASELINE
+  - Train student architecture on FULL-RESOLUTION images
+  - Isolates the RESOLUTION EFFECT from the DISTILLATION EFFECT
+  - If this outperforms EXP-2.1, it proves resolution matters
+  - If KD student (EXP-3.1) matches this, KD recovers resolution info
+  - Run: python train_student_hr.py
+  STATUS: [  ]
+
+[EXP-2.3] Teacher on Upsampled LR (Naive Upsampling Baseline) ← NEW BASELINE
+  - Take LR (128×128) images, bilinearly upsample to 1024×1024
+  - Feed to FROZEN trained teacher
+  - This tests: "Does naive upsampling + powerful model beat KD?"
+  - If KD student outperforms this, KD provides value beyond upsampling
+  - Run: python eval_teacher_upsampled.py
+  STATUS: [  ]
+
+[EXP-2.4] Student KD — Full Pipeline (α=1.0, β=0.5, γ=1.0, T=4)
+  - Frozen teacher → student with detection + logit KD + feature KD
+  - This is the MAIN RESULT of the paper
+  - Run: python train_student_kd.py
+  STATUS: [  ]
+
+[EXP-2.5] Student KD — Higher Feature KD Weight (α=1.0, β=0.5, γ=2.0)
+  - Hypothesis: adapter features need higher weight because they perform
+    semantic translation, not just spatial resizing
+  - Run: python run_experiment.py --experiment feature_weight_high
+  STATUS: [  ]
+
+
+================================================================================
+PHASE 3: ABLATION STUDIES
+================================================================================
+
+--- 3A: Temperature Sensitivity Analysis ---
+
+[EXP-3A.1] T=2  (sharper distributions)
+[EXP-3A.2] T=4  (baseline, moderate softening)
+[EXP-3A.3] T=6  (softer, more dark knowledge)
+[EXP-3A.4] T=8  (very soft, near-uniform risk)
+
+  - Same α=1.0, β=0.5, γ=1.0 for all
+  - Measure: mAP@0.5 vs T, training convergence speed
+  - Expected: optimal T ∈ [4, 6] for detection (unlike classification where T=20 works)
+  - Run: python run_experiment.py --experiment temperature_sweep
+  STATUS: [  ]
+
+
+--- 3B: Loss Component Ablation ---
+
+[EXP-3B.1] Detection Only       (α=1.0, β=0.0, γ=0.0) — same as EXP-2.1
+[EXP-3B.2] Det + Logit KD Only  (α=1.0, β=0.5, γ=0.0)
+[EXP-3B.3] Det + Feature KD Only(α=1.0, β=0.0, γ=1.0)
+[EXP-3B.4] Full KD              (α=1.0, β=0.5, γ=1.0) — same as EXP-2.4
+
+  - This tells us WHICH KD component drives performance
+  - Hypothesis: Feature KD > Logit KD for cross-resolution transfer
+  - Reason: spatial reasoning transfer is more critical than class confusion
+  - Run: python run_experiment.py --experiment loss_ablation
+  STATUS: [  ]
+
+
+--- 3C: Feature KD Weight Sensitivity ---
+
+[EXP-3C.1] γ=0.25  (low feature weight)
+[EXP-3C.2] γ=0.5   (moderate)
+[EXP-3C.3] γ=1.0   (equal to detection)
+[EXP-3C.4] γ=2.0   (high — semantic translation needs more emphasis)
+[EXP-3C.5] γ=4.0   (very high — might dominate gradient)
+
+  - Fixed: α=1.0, β=0.5, T=4
+  - Tests hypothesis that adapters need higher-than-expected γ
+  - Run: python run_experiment.py --experiment gamma_sweep
+  STATUS: [  ]
+
+
+================================================================================
+PHASE 4: ANALYSIS & REPORTING
+================================================================================
+
+[EXP-4.1] Full Evaluation
+  - Evaluate all trained models on val set
+  - Report: mAP@0.5, per-class AP, precision, recall, F1
+  - Report: FPS, parameter count, model size (MB)
+  - Run: python evaluate.py --all
+  STATUS: [  ]
+
+[EXP-4.2] OBB-aware Evaluation (Optional Extension)
+  - Evaluate using OBB IoU instead of AABB IoU
+  - Compare AABB-mAP vs OBB-mAP to quantify AABB approximation error
+  - Run: python evaluate.py --obb
+  STATUS: [  ]
+
+[EXP-4.3] Qualitative Analysis
+  - Visualize: teacher vs student detections on same images
+  - Visualize: feature maps (adapted student vs teacher FPN)
+  - Visualize: activation heatmaps showing attention focus
+  - Visualize: failure cases (what does the student miss?)
+  - Run: python visualize.py --model student_kd --num_samples 20
+  STATUS: [  ]
+
+[EXP-4.4] Convergence Analysis
+  - Plot training loss curves for all experiments
+  - Compare convergence speed: with vs without KD
+  - Show loss component breakdown over training
+  - Run: python plot_results.py
+  STATUS: [  ]
+
+
+================================================================================
+EXPECTED RESULTS TABLE (to be filled after experiments)
+================================================================================
+
+| Experiment              | mAP@0.5 | FPS   | Params | Notes                    |
+|-------------------------|---------|-------|--------|--------------------------|
+| Teacher (1024)          |         |       | ~30M   | Upper bound              |
+| Student Baseline (128)  |         |       | ~3M    | Lower bound              |
+| Student HR (1024)       |         |       | ~3M    | Resolution isolated      |
+| Teacher Upsamp. LR      |         |       | ~30M   | Naive upsampling         |
+| Student KD (128)        |         |       | ~3M    | Main result              |
+| KD T=2                  |         |       |        | Temperature sweep        |
+| KD T=6                  |         |       |        | Temperature sweep        |
+| KD T=8                  |         |       |        | Temperature sweep        |
+| KD logit-only           |         |       |        | Ablation                 |
+| KD feature-only         |         |       |        | Ablation                 |
+| KD γ=2.0                |         |       |        | Feature weight study     |
+
+
+================================================================================
+KEY HYPOTHESES TO VALIDATE
+================================================================================
+
+H1: KD student (128px) outperforms student baseline (128px)
+    → KD successfully transfers HR knowledge to LR student
+
+H2: KD student (128px) approaches student HR (1024px)
+    → KD recovers most of the resolution-induced performance gap
+
+H3: KD student outperforms naive upsampling + teacher
+    → Resolution-agnostic adapters add value beyond simple interpolation
+
+H4: Feature KD contributes more than Logit KD for cross-resolution
+    → Spatial reasoning transfer is critical at lower resolutions
+
+H5: Optimal T is lower for detection than classification
+    → Detection logits are sparser (fewer positives), need less smoothing
+
+H6: Higher γ improves performance due to semantic translation work
+    → Adapters bridging different receptive fields need stronger gradients
+
+
+================================================================================
+NOTES FOR REPORT WRITING
+================================================================================
+
+1. Always state "AABB-mAP" not just "mAP" when reporting numbers
+2. Acknowledge that published DOTA benchmarks use OBB-mAP
+3. Frame contribution as KD methodology, not SOTA detection
+4. The adapter design insight (semantic translation, not just resizing) is
+   the key intellectual contribution — emphasize this
+5. Temperature sensitivity shows understanding of KD mechanics
+6. Loss ablation shows rigorous experimental methodology

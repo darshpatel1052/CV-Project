@@ -30,7 +30,7 @@ def collate_fn(batch):
 
 def compute_detection_loss(
     cls_logits, bbox_regs, anchors, targets, device,
-    focal_loss_fn, bbox_loss_fn, num_classes=15
+    focal_loss_fn, bbox_loss_fn, num_classes=16
 ):
     """
     Compute detection loss with proper anchor-GT matching.
@@ -95,7 +95,7 @@ def compute_detection_loss(
 
 
 @torch.no_grad()
-def validate(model, val_loader, anchors, device, num_classes=15):
+def validate(model, val_loader, anchors, device, num_classes=16):
     """Run validation and compute mAP."""
     model.eval()
     all_predictions = []
@@ -178,7 +178,7 @@ def main():
     # -------------------------------------------------------------------------
     # MODEL
     # -------------------------------------------------------------------------
-    model = TeacherDetector(num_classes=num_classes, pretrained=cfg['teacher']['pretrained'])
+    model = TeacherDetector(num_classes=16, pretrained=True)
     model = model.to(device)
 
     # -------------------------------------------------------------------------
@@ -187,9 +187,9 @@ def main():
     # The teacher's detection head processes adapted features with strides [8,16,32,64]
     # w.r.t. the 1024×1024 input. But cls_logits has num_classes+1 outputs because
     # FocalLoss uses class 0 as background.
-    # However, the RetinaNetHead outputs num_classes (15) directly (no +1).
-    # We need to handle this: the head outputs (B, total_anchors, 15) for cls
-    # and matching returns targets in [0=bg, 1..15=classes].
+    # However, the RetinaNetHead outputs num_classes (16) directly (no +1).
+    # We need to handle this: the head outputs (B, total_anchors, 16) for cls
+    # and matching returns targets in [0=bg, 1..16=classes].
     # So we need num_classes+1 in the focal loss, or we shift matching.
     
     # Generate anchors matching the FPN feature map sizes
@@ -229,7 +229,7 @@ def main():
     )
 
     use_amp = cfg['teacher'].get('mixed_precision', True) and device.type == 'cuda'
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     total_iters = len(train_loader) * epochs
     warmup_iters = len(train_loader) * cfg['training_teacher'].get('warmup_epochs', 5)
@@ -246,8 +246,8 @@ def main():
     # Detection head outputs num_classes channels (no explicit background).
     # Our matching produces targets: 0=bg, 1..num_classes=objects.
     # So focal loss needs num_classes+1 classes.
-    # BUT: the RetinaNetHead currently outputs num_classes (15), not 16.
-    # So we need focal loss with 15 classes and shift targets back.
+    # BUT: the RetinaNetHead currently outputs num_classes (16), not 17.
+    # So we need focal loss with 16 classes and shift targets back.
     # Alternative: use sigmoid focal loss per-class (standard for RetinaNet).
     # Let's use sigmoid focal loss for proper RetinaNet behavior.
     

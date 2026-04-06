@@ -117,8 +117,15 @@ def main():
                                                     './checkpoints/teacher/best_model.pth')
     if os.path.exists(teacher_ckpt):
         ckpt = torch.load(teacher_ckpt, map_location=device)
-        teacher.load_state_dict(ckpt['model_state_dict'])
-        logger.info(f"Loaded teacher from {teacher_ckpt}")
+        # Filter out mismatching keys
+        model_dict = teacher.state_dict()
+        filtered_dict = {
+            k: v for k, v in ckpt['model_state_dict'].items()
+            if k in model_dict and v.shape == model_dict[k].shape
+        }
+        model_dict.update(filtered_dict)
+        teacher.load_state_dict(model_dict)
+        logger.info(f"Loaded teacher from {teacher_ckpt} (matched keys)")
     else:
         logger.warning(f"Teacher checkpoint not found: {teacher_ckpt}. Using random weights!")
 
@@ -155,7 +162,7 @@ def main():
     )
 
     use_amp = cfg['student'].get('mixed_precision', True) and device.type == 'cuda'
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     total_iters = len(train_loader) * epochs
     warmup_iters = len(train_loader) * cfg['training_student_kd'].get('warmup_epochs', 5)

@@ -1,6 +1,13 @@
 # ============================================================================
 # Resolution-Agnostic Knowledge Distillation for Remote Sensing
-# Configuration File
+# Configuration File — ENHANCED
+# ============================================================================
+#
+# IMPORTANT NOTES:
+# - This project uses Axis-Aligned Bounding Boxes (AABB), NOT Oriented (OBB)
+# - Results are reported as AABB-mAP and are NOT comparable to published
+#   OBB-mAP numbers from rotated detectors
+# - See experiments.txt for the full experiment plan
 # ============================================================================
 
 # Project
@@ -11,9 +18,10 @@ seed: 42
 # DATASET CONFIGURATION
 # ============================================================================
 dataset:
-  name: "DOTA"  # DOTA v1.0
+  name: "DOTA"  # DOTA v1.0 or v1.5
+  version: "v1.5"  # Track which version we're using
   split: "train"
-  num_classes: 15  # plane, ship, storage-tank, ..., swimming-pool
+  num_classes: 16
   classes:
     - plane
     - ship
@@ -30,60 +38,60 @@ dataset:
     - roundabout
     - soccer-ball-field
     - swimming-pool
-  
+    - container-crane
+
   # Paths
   raw_data_path: "./datasets/raw/DOTA_v1.0"
   processed_data_path: "./datasets/processed"
-  
-  # For testing: use smaller subset
-  use_subset: true
-  subset_size: 20  # Use 20 images for quick iteration
-  
+
+  # IMPORTANT: Use full dataset for meaningful results.
+  # If compute-constrained, reduce EPOCHS instead (fewer epochs > fewer images).
+  # Setting use_subset: false and subset_size: null uses ALL data.
+  use_subset: false
+  subset_size: null  # null = use full dataset
+
   # Image resolutions
   teacher_resolution: 1024  # HR images for teacher
-  student_resolution: 128   # LR images for student (4x downsampled)
+  student_resolution: 128   # LR images for student (8× downsampled)
+
+  # Bounding box format (explicit documentation)
+  bbox_format: "aabb"  # axis-aligned bounding boxes (derived from OBB annotations)
+  # NOTE: DOTA provides OBB annotations. We convert to AABB for simplicity.
+  # OBB IoU/NMS available in utils_obb.py for future extension.
 
 # ============================================================================
 # TEACHER MODEL CONFIGURATION
 # ============================================================================
 teacher:
-  backbone: "swin_tiny"  # Swin Transformer Tiny
-  pretrained: true       # Use ImageNet pretrained weights
+  backbone: "swin_tiny"
+  pretrained: true
   fpn:
-    in_channels: [96, 192, 384, 768]  # Swin-T output channels per stage
+    in_channels: [96, 192, 384, 768]
     out_channels: 256
-    num_levels: 4  # P3, P4, P5, P6
-  
-  # Detection head
-  head: "retina_head"  # RetinaNet-style head
-  num_classes: 15
-  num_anchors: 9  # 3 aspect ratios × 3 scales
-  
-  # Training
+    num_levels: 4
+  head: "retina_head"
+  num_classes: 16
+  num_anchors: 9
   device: "cuda"
-  mixed_precision: true  # Use AMP (fp16) for memory efficiency
+  mixed_precision: true
 
 # ============================================================================
 # STUDENT MODEL CONFIGURATION
 # ============================================================================
 student:
-  backbone: "mobilenet_v2"  # Lightweight backbone
+  backbone: "mobilenet_v2"
   pretrained: true
   fpn:
-    in_channels: [32, 64, 128, 256]  # MobileNetV2 output channels
-    out_channels: 128  # Lighter than teacher (256)
+    in_channels: [32, 64, 128, 256]
+    out_channels: 128
     num_levels: 4
-  
   head: "retina_head"
-  num_classes: 15
+  num_classes: 16
   num_anchors: 9
-  
-  # Adapters for feature KD
   adapters:
     enabled: true
-    type: "deconv"  # Options: deconv, bilinear, learned_projection
-    hidden_dim: 256  # Hidden dimension in adapter modules
-  
+    type: "deconv"
+    hidden_dim: 256
   device: "cuda"
   mixed_precision: true
 
@@ -91,26 +99,20 @@ student:
 # TRAINING: PHASE 1 - TEACHER
 # ============================================================================
 training_teacher:
-  epochs: 50
-  batch_size: 2  # Larger BS for HR images → needs ~10GB VRAM
+  epochs: 10
+  batch_size: 2
   learning_rate: 0.0001
   weight_decay: 0.0001
   warmup_epochs: 5
-  
-  # Optimizer
-  optimizer: "adam"  # adam, sgd
-  scheduler: "cosine"  # cosine, step
-  
-  # Data augmentation
+  optimizer: "adam"
+  scheduler: "cosine"
   augmentation:
     horizontal_flip: true
-    vertical_flip: false
+    vertical_flip: true   # DOTA has aerial perspective — vertical flip is valid
     rotate: true
     color_jitter: true
-  
-  # Logging
-  log_interval: 10  # Log every 10 batches
-  checkpoint_interval: 5  # Save checkpoint every 5 epochs
+  log_interval: 10
+  checkpoint_interval: 5
   output_dir: "./checkpoints/teacher"
   log_dir: "./logs/teacher"
 
@@ -119,56 +121,73 @@ training_teacher:
 # ============================================================================
 training_student_baseline:
   epochs: 50
-  batch_size: 8  # Can use larger BS for LR images (~3-4GB VRAM)
+  batch_size: 8
   learning_rate: 0.0005
   weight_decay: 0.0001
   warmup_epochs: 5
-  
   optimizer: "adam"
   scheduler: "cosine"
-  
   augmentation:
     horizontal_flip: true
-    vertical_flip: false
+    vertical_flip: true
     rotate: true
     color_jitter: true
-  
   log_interval: 10
-  checkpoint_interval: 25
+  checkpoint_interval: 10
   output_dir: "./checkpoints/student_baseline"
   log_dir: "./logs/student_baseline"
+
+# ============================================================================
+# TRAINING: PHASE 2A' - STUDENT ON HR (Resolution Isolation Baseline)
+# ============================================================================
+training_student_hr:
+  epochs: 50
+  batch_size: 2  # HR images need smaller batch
+  learning_rate: 0.0005
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  optimizer: "adam"
+  scheduler: "cosine"
+  augmentation:
+    horizontal_flip: true
+    vertical_flip: true
+    rotate: true
+    color_jitter: true
+  log_interval: 10
+  checkpoint_interval: 10
+  output_dir: "./checkpoints/student_hr"
+  log_dir: "./logs/student_hr"
 
 # ============================================================================
 # TRAINING: PHASE 2B - STUDENT (WITH KD)
 # ============================================================================
 training_student_kd:
   epochs: 50
-  batch_size: 4  # Reduced due to both models in memory
+  batch_size: 4
   learning_rate: 0.0005
   weight_decay: 0.0001
   warmup_epochs: 5
-  
   optimizer: "adam"
   scheduler: "cosine"
-  
+
   # Knowledge distillation parameters
   kd:
-    temperature: 4.0  # Softness of logit distributions
-    alpha: 1.0        # Weight for detection loss
-    beta: 0.5         # Weight for logit KD loss
-    gamma: 1.0        # Weight for feature KD loss
-  
+    temperature: 4.0
+    alpha: 1.0     # Weight for detection loss (primary task, always 1.0)
+    beta: 0.5      # Weight for logit KD loss (class confusion transfer)
+    gamma: 1.0     # Weight for feature KD loss (spatial representation alignment)
+    # NOTE: gamma may need to be higher (2.0-4.0) because adapters perform
+    # semantic translation, not just spatial resizing. See experiments.txt EXP-3C.
+
   augmentation:
     horizontal_flip: true
-    vertical_flip: false
+    vertical_flip: true
     rotate: true
     color_jitter: true
-  
-  # Teacher checkpoint to load
+
   teacher_checkpoint: "./checkpoints/teacher/best_model.pth"
-  
   log_interval: 10
-  checkpoint_interval: 25
+  checkpoint_interval: 10
   output_dir: "./checkpoints/student_kd"
   log_dir: "./logs/student_kd"
 
@@ -176,12 +195,14 @@ training_student_kd:
 # EVALUATION CONFIGURATION
 # ============================================================================
 evaluation:
-  # Metrics
   iou_threshold: 0.5
-  conf_threshold: 0.5
+  conf_threshold: 0.05
+  nms_threshold: 0.5
   max_detections: 100
-  
-  # Output
+
+  # Which IoU to use for evaluation
+  iou_type: "aabb"  # Options: "aabb" (default), "obb" (requires utils_obb.py)
+
   output_dir: "./outputs/metrics"
   save_predictions: true
 
@@ -190,8 +211,46 @@ evaluation:
 # ============================================================================
 visualization:
   output_dir: "./outputs/visualizations"
-  num_samples: 10  # Visualize top 10 detections
+  num_samples: 10
   show_teacher: true
   show_student_baseline: true
   show_student_kd: true
+  show_student_hr: true
   show_feature_maps: true
+  show_obb: false  # Set to true to overlay OBB annotations
+
+# ============================================================================
+# EXPERIMENT CONFIGURATION (for run_experiment.py)
+# ============================================================================
+experiments:
+  # Temperature sweep: T ∈ {2, 4, 6, 8}
+  temperature_sweep:
+    values: [2.0, 4.0, 6.0, 8.0]
+    fixed:
+      alpha: 1.0
+      beta: 0.5
+      gamma: 1.0
+
+  # Loss ablation
+  loss_ablation:
+    configs:
+      - name: "logit_only"
+        alpha: 1.0
+        beta: 0.5
+        gamma: 0.0
+      - name: "feature_only"
+        alpha: 1.0
+        beta: 0.0
+        gamma: 1.0
+      - name: "full_kd"
+        alpha: 1.0
+        beta: 0.5
+        gamma: 1.0
+
+  # Feature KD weight sweep: γ ∈ {0.25, 0.5, 1.0, 2.0, 4.0}
+  gamma_sweep:
+    values: [0.25, 0.5, 1.0, 2.0, 4.0]
+    fixed:
+      alpha: 1.0
+      beta: 0.5
+      temperature: 4.0

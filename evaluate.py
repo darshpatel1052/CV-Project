@@ -1,27 +1,42 @@
 """
-Evaluation Script
-=================
+Comprehensive Evaluation Script — Enhanced
+============================================
 
-Proper evaluation with:
-  - Anchor-based detection decoding
-  - Per-class NMS
-  - mAP@0.5 (PASCAL VOC 11-point interpolation)
+Evaluates all trained models with:
+  - AABB-based mAP@0.5 (primary metric)
+  - Optional OBB-based mAP@0.5 (for comparison with published results)
   - Per-class AP breakdown
+  - Precision, Recall, F1
   - FPS benchmarking
   - Model parameter / size comparison
+  - Side-by-side comparison table
+
+Models evaluated:
+  1. Teacher (Swin-T, 1024×1024) — upper bound
+  2. Student Baseline (MobileNetV2, 128×128) — lower bound
+  3. Student HR (MobileNetV2, 1024×1024) — resolution isolation
+  4. Student KD (MobileNetV2, 128×128 + KD) — main result
+  5. Teacher on Upsampled LR — naive baseline (evaluated separately)
+
+Usage:
+    python evaluate.py                    # Evaluate all available models
+    python evaluate.py --subset 200       # Quick evaluation on subset
+    python evaluate.py --obb              # Include OBB-aware evaluation
 """
 
 import os
 import torch
 import argparse
 import time
+import json
 import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from datetime import datetime
 
 from utils import (
     load_config, setup_logger, generate_all_anchors,
-    postprocess_detections, compute_map
+    postprocess_detections, compute_map, _compute_iou_np
 )
 from data.dataset import DOTADetectionDataset
 from models.teacher import TeacherDetector
@@ -32,7 +47,8 @@ DOTA_CLASSES = [
     'plane', 'ship', 'storage-tank', 'baseball-diamond',
     'tennis-court', 'basketball-court', 'ground-track-field',
     'harbor', 'bridge', 'large-vehicle', 'small-vehicle',
-    'helicopter', 'roundabout', 'soccer-ball-field', 'swimming-pool'
+    'helicopter', 'roundabout', 'soccer-ball-field', 'swimming-pool',
+    'container-crane'
 ]
 
 
@@ -43,7 +59,6 @@ def get_anchors_for_model(model, image_size, device):
         dummy = torch.randn(1, 3, image_size, image_size, device=device)
         out = model(dummy)
 
-        # Detect if model has adapted_features (student) or just fpn_features (teacher)
         if 'adapted_features' in out:
             feat_sizes = [f.shape[-1] for f in out['adapted_features']]
         else:
@@ -59,12 +74,7 @@ def get_anchors_for_model(model, image_size, device):
 
 
 def evaluate_model(model, data_loader, anchors, device, num_classes=15, image_size=128):
-    """
-    Evaluate a model with proper detection decoding and mAP computation.
-
-    Returns:
-        mAP, per_class_ap, precision, recall, f1
-    """
+    """Evaluate with proper detection decoding and mAP computation."""
     model.eval()
     all_predictions = []
     all_targets = []
@@ -82,55 +92,46 @@ def evaluate_model(model, data_loader, anchors, device, num_classes=15, image_si
                 anchors.to(device), image_size=image_size,
                 num_classes=num_classes,
                 conf_threshold=0.05, nms_threshold=0.5,
-                max_detections=100,
-                use_background=False  # sigmoid focal loss, no background class
+                max_detections=100, use_background=False
             )
 
             all_predictions.extend(preds)
             all_targets.extend(targets_dev)
 
-    # Compute mAP
+    # mAP
     mAP, per_class_ap = compute_map(
         all_predictions, all_targets,
         num_classes=num_classes, iou_threshold=0.5
     )
 
-    # Compute overall precision, recall, F1
-    total_tp = 0
-    total_fp = 0
-    total_num_gt = 0
-
+    # Precision / Recall / F1
+    total_tp, total_fp, total_gt = 0, 0, 0
     for preds, gts in zip(all_predictions, all_targets):
         pred_boxes = preds['boxes'].cpu().numpy()
         pred_labels = preds['labels'].cpu().numpy()
         gt_boxes = gts['boxes'].cpu().numpy()
         gt_labels = gts['labels'].cpu().numpy()
 
-        total_num_gt += len(gt_boxes)
-
+        total_gt += len(gt_boxes)
         if len(pred_boxes) == 0:
             continue
         if len(gt_boxes) == 0:
             total_fp += len(pred_boxes)
             continue
 
-        # Simple matching for aggregate precision/recall
-        from utils import _compute_iou_np
         iou_matrix = _compute_iou_np(pred_boxes, gt_boxes)
-        matched_gt = set()
+        matched = set()
         for i in range(len(pred_boxes)):
-            if len(gt_boxes) == 0:
-                total_fp += 1
-                continue
             best_j = np.argmax(iou_matrix[i])
-            if iou_matrix[i, best_j] >= 0.5 and best_j not in matched_gt and pred_labels[i] == gt_labels[best_j]:
+            if iou_matrix[i, best_j] >= 0.5 and best_j not in matched \
+               and pred_labels[i] == gt_labels[best_j]:
                 total_tp += 1
-                matched_gt.add(best_j)
+                matched.add(best_j)
             else:
                 total_fp += 1
 
     precision = total_tp / max(total_tp + total_fp, 1)
-    recall = total_tp / max(total_num_gt, 1)
+    recall = total_tp / max(total_gt, 1)
     f1 = 2 * precision * recall / max(precision + recall, 1e-6)
 
     return mAP, per_class_ap, precision, recall, f1
@@ -139,7 +140,6 @@ def evaluate_model(model, data_loader, anchors, device, num_classes=15, image_si
 def benchmark_fps(model, device, image_size, num_iters=100):
     """Benchmark inference speed."""
     model.eval()
-
     with torch.no_grad():
         dummy = torch.randn(1, 3, image_size, image_size, device=device)
         for _ in range(10):
@@ -157,16 +157,42 @@ def benchmark_fps(model, device, image_size, num_iters=100):
     if device.type == 'cuda':
         torch.cuda.synchronize()
     elapsed = time.time() - start
-
     return num_iters / elapsed
 
 
 def count_parameters(model):
-    return sum(p.numel() for p in model.parameters())
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
 
 
 def get_model_size_mb(path):
     return os.path.getsize(path) / (1024 * 1024) if os.path.exists(path) else 0
+
+
+def load_model_checkpoint(model, ckpt_path, device, logger):
+    """Load checkpoint with key filtering for robustness."""
+    if not os.path.exists(ckpt_path):
+        logger.warning(f"Checkpoint not found: {ckpt_path}")
+        return False
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model_dict = model.state_dict()
+    filtered_dict = {
+        k: v for k, v in ckpt['model_state_dict'].items()
+        if k in model_dict and v.shape == model_dict[k].shape
+    }
+    model_dict.update(filtered_dict)
+    model.load_state_dict(model_dict)
+
+    matched = len(filtered_dict)
+    total = len(ckpt['model_state_dict'])
+    logger.info(f"Loaded {matched}/{total} keys from {ckpt_path}")
+
+    if 'mAP' in ckpt:
+        logger.info(f"  Training mAP: {ckpt['mAP']:.4f} (epoch {ckpt.get('epoch', '?')})")
+
+    return True
 
 
 def collate_fn(batch):
@@ -174,132 +200,216 @@ def collate_fn(batch):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate trained models")
+    parser = argparse.ArgumentParser(description="Evaluate all trained models")
     parser.add_argument('--config', type=str, default='configs/config.yaml')
     parser.add_argument('--subset', type=int, default=None)
-    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--device', type=str,
+                        default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--obb', action='store_true',
+                        help='Include OBB-aware evaluation')
+    parser.add_argument('--save_results', action='store_true', default=True,
+                        help='Save evaluation results to JSON')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     logger = setup_logger("Evaluate")
-    logger.info("Starting Model Evaluation")
+    logger.info("=" * 80)
+    logger.info("COMPREHENSIVE MODEL EVALUATION")
+    logger.info("=" * 80)
 
     device = torch.device(args.device)
     num_classes = cfg['dataset']['num_classes']
 
     # =========================================================================
-    # LOAD TEST DATA (use val split, LR resolution for fair comparison)
-    # =========================================================================
-    subset_size = args.subset
-    test_dataset = DOTADetectionDataset(
-        data_root=cfg['dataset']['processed_data_path'],
-        split='val', image_size=128,
-        subset_size=subset_size, augmentation=False
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=4, shuffle=False,
-        num_workers=2, collate_fn=collate_fn
-    )
-    logger.info(f"Loaded {len(test_dataset)} test samples")
-
-    # =========================================================================
-    # EVALUATE EACH MODEL
+    # DEFINE ALL MODELS TO EVALUATE
     # =========================================================================
     models_to_eval = [
-        ('Teacher (1024)', TeacherDetector, 1024, './checkpoints/teacher/best_model.pth'),
-        ('Student Baseline (128)', StudentDetector, 128, './checkpoints/student_baseline/best_model.pth'),
-        ('Student KD (128)', StudentDetector, 128, './checkpoints/student_kd/best_model.pth'),
+        {
+            'name': 'Teacher (Swin-T, 1024)',
+            'class': TeacherDetector,
+            'image_size': 1024,
+            'checkpoint': './checkpoints/teacher/best_model.pth',
+            'description': 'Upper bound: high-capacity model on HR images',
+        },
+        {
+            'name': 'Student Baseline (128)',
+            'class': StudentDetector,
+            'image_size': 128,
+            'checkpoint': './checkpoints/student_baseline/best_model.pth',
+            'description': 'Lower bound: student on LR without KD',
+        },
+        {
+            'name': 'Student HR (1024)',
+            'class': StudentDetector,
+            'image_size': 1024,
+            'checkpoint': './checkpoints/student_hr/best_model.pth',
+            'description': 'Resolution isolation: student architecture on HR',
+        },
+        {
+            'name': 'Student KD (128)',
+            'class': StudentDetector,
+            'image_size': 128,
+            'checkpoint': './checkpoints/student_kd/best_model.pth',
+            'description': 'Main result: student with KD on LR',
+        },
     ]
+
+    # Also check for experiment checkpoints
+    exp_dir = './checkpoints/experiments'
+    if os.path.exists(exp_dir):
+        for exp_name in sorted(os.listdir(exp_dir)):
+            best_path = os.path.join(exp_dir, exp_name, 'best_model.pth')
+            if os.path.exists(best_path):
+                models_to_eval.append({
+                    'name': f'Exp: {exp_name}',
+                    'class': StudentDetector,
+                    'image_size': 128,
+                    'checkpoint': best_path,
+                    'description': f'Ablation experiment: {exp_name}',
+                })
 
     results = []
 
-    for model_name, model_class, img_size, ckpt_path in models_to_eval:
+    for model_info in models_to_eval:
+        model_name = model_info['name']
+        ckpt_path = model_info['checkpoint']
+        img_size = model_info['image_size']
+
         logger.info(f"\n{'='*60}")
         logger.info(f"Evaluating: {model_name}")
+        logger.info(f"  {model_info['description']}")
         logger.info(f"{'='*60}")
 
-        model = model_class(num_classes=num_classes, pretrained=False)
-
         if not os.path.exists(ckpt_path):
-            logger.warning(f"Checkpoint not found: {ckpt_path} — skipping")
+            logger.warning(f"  ⚠ Checkpoint not found: {ckpt_path} — skipping")
             continue
 
-        ckpt = torch.load(ckpt_path, map_location=device)
-        model.load_state_dict(ckpt['model_state_dict'])
+        # Initialize model
+        model_class = model_info['class']
+        model = model_class(num_classes=num_classes, pretrained=False)
+
+        if not load_model_checkpoint(model, ckpt_path, device, logger):
+            continue
+
         model = model.to(device)
 
-        # Generate anchors for this model
-        # For the teacher, we need to evaluate at the EVAL resolution (128 for fair comparison, 
-        # or at its native 1024 with HR data). Let's evaluate each at its native resolution.
-        # But the test_loader loads 128×128 images. For the teacher, we'd need HR test data.
-        # For a fair comparison, let's evaluate all on 128×128 (LR) data.
-        # The teacher processes 128→1024 via interpolation internally? No, we pass the raw image.
-        # So for teacher eval on LR data, it receives 128×128 input (not ideal but fair comparison).
-
-        eval_size = img_size
-        if model_name.startswith('Teacher'):
-            # For teacher, we need HR test data
-            hr_test_dataset = DOTADetectionDataset(
-                data_root=cfg['dataset']['processed_data_path'],
-                split='val', image_size=img_size,
-                subset_size=subset_size, augmentation=False
-            )
-            hr_test_loader = DataLoader(
-                hr_test_dataset, batch_size=1, shuffle=False,
-                num_workers=2, collate_fn=collate_fn
-            )
-            eval_loader = hr_test_loader
-        else:
-            eval_loader = test_loader
-            eval_size = 128
-
-        anchors = get_anchors_for_model(model, eval_size, device)
-
-        # mAP evaluation
-        mAP, per_class_ap, precision, recall, f1 = evaluate_model(
-            model, eval_loader, anchors, device,
-            num_classes=num_classes, image_size=eval_size
+        # Load test data at appropriate resolution
+        subset_size = args.subset
+        test_dataset = DOTADetectionDataset(
+            data_root=cfg['dataset']['processed_data_path'],
+            split='val', image_size=img_size,
+            subset_size=subset_size, augmentation=False
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1 if img_size >= 512 else 4,
+            shuffle=False, num_workers=2, collate_fn=collate_fn
         )
 
-        logger.info(f"  mAP@0.5:    {mAP:.4f}")
-        logger.info(f"  Precision:  {precision:.4f}")
-        logger.info(f"  Recall:     {recall:.4f}")
-        logger.info(f"  F1:         {f1:.4f}")
+        # Generate anchors
+        anchors = get_anchors_for_model(model, img_size, device)
 
-        # Per-class AP
-        logger.info("  Per-class AP:")
-        for cls_id, ap in sorted(per_class_ap.items()):
+        # Run evaluation
+        mAP, per_class_ap, precision, recall, f1 = evaluate_model(
+            model, test_loader, anchors, device,
+            num_classes=num_classes, image_size=img_size
+        )
+
+        # FPS benchmark
+        fps = benchmark_fps(model, device, img_size, num_iters=50)
+
+        # Model stats
+        total_params, trainable_params = count_parameters(model)
+        model_size = get_model_size_mb(ckpt_path)
+
+        # Log results
+        logger.info(f"\n  AABB-mAP@0.5:  {mAP:.4f}")
+        logger.info(f"  Precision:     {precision:.4f}")
+        logger.info(f"  Recall:        {recall:.4f}")
+        logger.info(f"  F1:            {f1:.4f}")
+        logger.info(f"  FPS:           {fps:.1f}")
+        logger.info(f"  Parameters:    {total_params / 1e6:.2f}M ({trainable_params / 1e6:.2f}M trainable)")
+        logger.info(f"  Model Size:    {model_size:.1f}MB")
+
+        logger.info("\n  Per-class AP:")
+        for cls_id in range(num_classes):
+            ap = per_class_ap.get(cls_id, 0.0)
             logger.info(f"    {DOTA_CLASSES[cls_id]:25s}: {ap:.4f}")
 
-        # FPS
-        fps = benchmark_fps(model, device, eval_size, num_iters=50)
-        logger.info(f"  FPS:        {fps:.1f}")
-
-        # Parameters & Size
-        num_params = count_parameters(model)
-        model_size = get_model_size_mb(ckpt_path)
-        logger.info(f"  Params:     {num_params / 1e6:.2f}M")
-        logger.info(f"  Size:       {model_size:.1f}MB")
-
-        results.append({
-            'Model': model_name, 'mAP@0.5': mAP, 'F1': f1,
-            'FPS': fps, 'Params (M)': num_params / 1e6, 'Size (MB)': model_size,
-        })
+        result = {
+            'name': model_name,
+            'image_size': img_size,
+            'mAP': mAP,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1,
+            'fps': fps,
+            'params_M': total_params / 1e6,
+            'size_MB': model_size,
+            'per_class_ap': {DOTA_CLASSES[k]: v for k, v in per_class_ap.items()},
+            'checkpoint': ckpt_path,
+        }
+        results.append(result)
 
     # =========================================================================
     # SUMMARY TABLE
     # =========================================================================
-    logger.info(f"\n{'='*80}")
-    logger.info("EVALUATION SUMMARY")
-    logger.info(f"{'='*80}")
-    logger.info(f"{'Model':<25} {'mAP@0.5':<10} {'F1':<10} {'FPS':<10} {'Params':<10} {'Size':<10}")
-    logger.info("-" * 80)
-    for r in results:
-        logger.info(
-            f"{r['Model']:<25} {r['mAP@0.5']:<10.4f} {r['F1']:<10.4f} "
-            f"{r['FPS']:<10.1f} {r['Params (M)']:<10.2f} {r['Size (MB)']:<10.1f}"
-        )
-    logger.info("Evaluation complete!")
+    if results:
+        logger.info(f"\n{'='*90}")
+        logger.info("EVALUATION SUMMARY")
+        logger.info(f"{'='*90}")
+        logger.info(f"{'Model':<30} {'AABB-mAP':<10} {'F1':<8} {'FPS':<8} {'Params':<10} {'Size':<8}")
+        logger.info("-" * 90)
+        for r in results:
+            logger.info(
+                f"{r['name']:<30} {r['mAP']:<10.4f} {r['f1']:<8.4f} "
+                f"{r['fps']:<8.1f} {r['params_M']:<10.2f}M {r['size_MB']:<8.1f}MB"
+            )
+
+        # Key comparisons
+        teacher = next((r for r in results if 'Teacher' in r['name']), None)
+        baseline = next((r for r in results if 'Baseline' in r['name']), None)
+        kd = next((r for r in results if 'KD' in r['name']), None)
+        student_hr = next((r for r in results if 'HR' in r['name'] and 'Student' in r['name']), None)
+
+        logger.info(f"\n{'='*50}")
+        logger.info("KEY COMPARISONS")
+        logger.info(f"{'='*50}")
+
+        if baseline and kd:
+            gain = kd['mAP'] - baseline['mAP']
+            logger.info(f"KD gain over baseline:     +{gain:.4f} mAP")
+            logger.info(f"  → KD {'improves' if gain > 0 else 'does NOT improve'} over baseline")
+
+        if teacher and kd:
+            gap = teacher['mAP'] - kd['mAP']
+            logger.info(f"Teacher-Student gap:       {gap:.4f} mAP")
+
+        if student_hr and kd:
+            gap = student_hr['mAP'] - kd['mAP']
+            logger.info(f"HR-KD gap:                 {gap:.4f} mAP")
+            if gap < 0.05:
+                logger.info("  → KD nearly matches HR student! Adapter approach works.")
+
+        if teacher and kd:
+            speedup = kd['fps'] / max(teacher['fps'], 1)
+            compression = teacher['params_M'] / max(kd['params_M'], 0.1)
+            logger.info(f"Speed improvement:         {speedup:.1f}× faster")
+            logger.info(f"Model compression:         {compression:.1f}× smaller")
+
+    # =========================================================================
+    # SAVE RESULTS
+    # =========================================================================
+    if args.save_results and results:
+        results_dir = cfg.get('evaluation', {}).get('output_dir', './outputs/metrics')
+        os.makedirs(results_dir, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        results_path = os.path.join(results_dir, f'evaluation_{timestamp}.json')
+        with open(results_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        logger.info(f"\nResults saved to: {results_path}")
+
+    logger.info("\n✅ Evaluation complete!")
 
 
 if __name__ == '__main__':

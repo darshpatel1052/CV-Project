@@ -136,7 +136,7 @@ class DetectionLoss(nn.Module):
         reg_weight: Weight for regression loss (typically higher to balance scales)
     """
 
-    def __init__(self, num_classes=15, cls_weight=1.0, reg_weight=50.0):
+    def __init__(self, num_classes=16, cls_weight=1.0, reg_weight=50.0):
         super().__init__()
         self.focal_loss = FocalLoss(alpha=0.25, gamma=2.0)
         self.smooth_l1 = SmoothL1Loss(beta=1.0 / 9.0)

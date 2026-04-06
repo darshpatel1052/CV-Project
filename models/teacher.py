@@ -44,7 +44,7 @@ class TeacherDetector(nn.Module):
                            Essential for rapid convergence in Phase 1.
     """
     
-    def __init__(self, num_classes: int = 15, pretrained: bool = True):
+    def __init__(self, num_classes: int = 16, pretrained: bool = True):
         super().__init__()
         
         # 1. Backbone Initialization: Swin-T
@@ -145,7 +145,7 @@ if __name__ == "__main__":
     try:
         # 1. Initialize Teacher
         print("Initializing Teacher Model (Pretrained=False for speed)...")
-        model = TeacherDetector(num_classes=15, pretrained=False)
+        model = TeacherDetector(num_classes=16, pretrained=False)
         model.eval()
         
         # 2. Generate Dummy 1024x1024 High-Resolution Image Tensor
