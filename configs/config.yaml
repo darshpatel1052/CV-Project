@@ -121,7 +121,7 @@ training_teacher:
 # ============================================================================
 training_student_baseline:
   epochs: 50
-  batch_size: 8
+  batch_size: 16
   learning_rate: 0.0005
   weight_decay: 0.0001
   warmup_epochs: 5
@@ -163,7 +163,7 @@ training_student_hr:
 # ============================================================================
 training_student_kd:
   epochs: 50
-  batch_size: 4
+  batch_size: 8
   learning_rate: 0.0005
   weight_decay: 0.0001
   warmup_epochs: 5

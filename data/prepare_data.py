@@ -158,6 +158,9 @@ class DOTADataPreprocessor:
                     logger.warning(f"Failed to read image: {image_path}")
                     continue
                 
+                # Convert BGR to RGB mode
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                
                 image_h, image_w = image.shape[:2]
                 
                 # Load annotations
@@ -437,8 +440,12 @@ class DOTADataPreprocessor:
         output_dir_base = os.path.join(self.output_root, f'{split}_{quality}')
         
         # Save image
+        # image is in RGB order (converted from BGR in _process_split).
+        # cv2.imwrite expects BGR, so convert back before saving.
+        # PIL (used in dataset.py) will read the JPEG bytes and interpret them
+        # correctly as RGB, giving the right colors end-to-end.
         image_path = os.path.join(output_dir_base, 'images', f"{patch_name}.jpg")
-        cv2.imwrite(image_path, image)
+        cv2.imwrite(image_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
         
         # Save labels in DOTA format
         label_path = os.path.join(output_dir_base, 'labels', f"{patch_name}.txt")

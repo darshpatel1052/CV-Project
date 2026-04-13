@@ -62,7 +62,8 @@ def main():
     )
     train_loader = DataLoader(
         train_dataset, batch_size=cfg['training_student_baseline']['batch_size'],
-        shuffle=True, num_workers=2, collate_fn=collate_fn, pin_memory=True
+        shuffle=True, num_workers=4, collate_fn=collate_fn,
+        pin_memory=True, persistent_workers=True
     )
 
     val_subset = min(200, subset_size) if subset_size else 200
@@ -73,7 +74,8 @@ def main():
     )
     val_loader = DataLoader(
         val_dataset, batch_size=max(1, cfg['training_student_baseline']['batch_size'] // 2),
-        shuffle=False, num_workers=2, collate_fn=collate_fn, pin_memory=True
+        shuffle=False, num_workers=4, collate_fn=collate_fn,
+        pin_memory=True, persistent_workers=True
     )
     logger.info(f"Train: {len(train_dataset)} images, Val: {len(val_dataset)} images")
 
@@ -82,6 +84,10 @@ def main():
     # =========================================================================
     model = StudentDetector(num_classes=num_classes, pretrained=cfg['student']['pretrained'])
     model = model.to(device)
+    # torch.compile() fuses operations and reduces Python overhead (~15-30% speedup).
+    # The first epoch is slower due to one-time compilation; subsequent epochs are faster.
+    if device.type == 'cuda':
+        model = torch.compile(model)
 
     # The student's detection head runs on adapted_features (upsampled 4×).
     # So the effective spatial sizes are same as if the input were 4× larger.

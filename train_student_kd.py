@@ -28,16 +28,44 @@ from losses.detection_loss import FocalLoss, SmoothL1Loss
 from train_teacher import compute_detection_loss, validate
 
 
-def compute_feature_kd_loss(teacher_features, student_features):
-    """MSE between teacher and student FPN features (averaged across levels)."""
+def compute_feature_kd_loss(teacher_features, student_features, logger=None):
+    """
+    Feature KD with:
+    - channel-wise normalization → compare structure, not magnitude
+    - detach teacher → no gradient flow into teacher
+    - spatial scaling → prevent large feature maps from dominating loss
+    """
     loss = 0.0
     count = 0
+
     for t_feat, s_feat in zip(teacher_features, student_features):
-        # Ensure spatial dimensions match (they should from adapters)
+        # Match spatial size if needed
         if t_feat.shape != s_feat.shape:
-            s_feat = F.interpolate(s_feat, size=t_feat.shape[2:], mode='bilinear', align_corners=False)
-        loss += F.mse_loss(s_feat, t_feat, reduction='mean')
+            s_feat = F.interpolate(
+                s_feat,
+                size=t_feat.shape[2:],
+                mode='bilinear',
+                align_corners=False
+            )
+        
+        if logger:
+            logger.info(f"RAW feature diff: {(s_feat - t_feat).abs().mean().item():.6f}")
+   
+        # Prevent gradients flowing into teacher (stability + correctness)
+        t_feat = t_feat.detach()
+
+        # Normalize across channels → focus on feature patterns, not scale
+        s_feat_norm = F.normalize(s_feat, dim=1)
+        t_feat_norm = F.normalize(t_feat, dim=1)
+
+        # Compute MSE and scale by spatial size
+        # prevents large feature maps from dominating loss
+        spatial_size = t_feat.shape[-1] * t_feat.shape[-2]
+
+        #loss += F.mse_loss(s_feat_norm, t_feat_norm, reduction='mean') / spatial_size
+        loss += F.mse_loss(s_feat_norm, t_feat_norm, reduction='mean')
         count += 1
+
     return loss / max(count, 1)
 
 
@@ -47,6 +75,21 @@ def compute_logit_kd_loss(teacher_logits, student_logits, temperature=4.0):
         teacher_logits = teacher_logits.reshape(-1, teacher_logits.shape[-1])
     if student_logits.dim() > 2:
         student_logits = student_logits.reshape(-1, student_logits.shape[-1])
+
+    # Upcast to float32 to prevent NaN overflow under AMP (Float16)
+    teacher_logits = teacher_logits.float()
+    student_logits = student_logits.float()
+    teacher_logits = torch.nan_to_num(teacher_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+    student_logits = torch.nan_to_num(student_logits, nan=0.0, posinf=1e4, neginf=-1e4)
+
+    teacher_logits = teacher_logits - teacher_logits.max(dim=-1, keepdim=True).values
+    student_logits = student_logits - student_logits.max(dim=-1, keepdim=True).values
+    # so that we don't get NaNs in exp() below
+    # this is especially important under AMP where large logits can easily overflow to inf, causing NaNs in the loss and gradients
+
+    teacher_logits = torch.clamp(teacher_logits, -50, 50)
+    student_logits = torch.clamp(student_logits, -50, 50)
+    # this was for debugging NaN issues, but can also help stabilize training under AMP
 
     teacher_soft = F.softmax(teacher_logits / temperature, dim=-1)
     student_log_soft = F.log_softmax(student_logits / temperature, dim=-1)
@@ -60,10 +103,15 @@ def collate_fn(batch):
 
 
 def main():
+
+    print("USING UPDATED train_student_kd.py") #debugging
+
     parser = argparse.ArgumentParser(description="Train Student with Knowledge Distillation")
     parser.add_argument('--config', type=str, default='configs/config.yaml')
     parser.add_argument('--epochs', type=int, default=None)
     parser.add_argument('--subset', type=int, default=None)
+    parser.add_argument('--no_amp', action='store_true', help='Disable AMP for stability')
+    parser.add_argument('--no_compile', action='store_true', help='Disable torch.compile for stability')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -92,7 +140,8 @@ def main():
     )
     train_loader = DataLoader(
         train_dataset, batch_size=cfg['training_student_kd']['batch_size'],
-        shuffle=True, num_workers=2, collate_fn=collate_fn, pin_memory=True
+        shuffle=True, num_workers=4, collate_fn=collate_fn,
+        pin_memory=True, persistent_workers=True
     )
 
     val_subset = min(200, subset_size) if subset_size else 200
@@ -103,7 +152,8 @@ def main():
     )
     val_loader = DataLoader(
         val_dataset, batch_size=max(1, cfg['training_student_kd']['batch_size'] // 2),
-        shuffle=False, num_workers=2, collate_fn=collate_fn, pin_memory=True
+        shuffle=False, num_workers=4, collate_fn=collate_fn,
+        pin_memory=True, persistent_workers=True
     )
     logger.info(f"Train: {len(train_dataset)}, Val: {len(val_dataset)}")
 
@@ -137,6 +187,9 @@ def main():
     logger.info("Initializing student...")
     student = StudentDetector(num_classes=num_classes, pretrained=cfg['student']['pretrained'])
     student = student.to(device)
+    # Compile student only (teacher is frozen inference-only, compile overhead not worth it)
+    if device.type == 'cuda' and not args.no_compile:
+        student = torch.compile(student)
 
     # =========================================================================
     # ANCHORS for student detection loss
@@ -161,7 +214,7 @@ def main():
         weight_decay=cfg['training_student_kd']['weight_decay']
     )
 
-    use_amp = cfg['student'].get('mixed_precision', True) and device.type == 'cuda'
+    use_amp = cfg['student'].get('mixed_precision', True) and device.type == 'cuda' and not args.no_amp
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     total_iters = len(train_loader) * epochs
@@ -182,8 +235,12 @@ def main():
     kd_cfg = cfg['training_student_kd']['kd']
     alpha = kd_cfg.get('alpha', 1.0)
     beta = kd_cfg.get('beta', 0.5)
-    gamma = kd_cfg.get('gamma', 1.0)
+    #gamma = kd_cfg.get('gamma', 1.0)
+    #gamma = kd_cfg.get('gamma', 1e-4)
+    #gamma = 1e-2
+    gamma = 0.07
     temperature = kd_cfg.get('temperature', 4.0)
+    print("DEBUG GAMMA:", gamma)
 
     checkpoint_dir = cfg['training_student_kd'].get('output_dir', './checkpoints/student_kd')
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -242,6 +299,22 @@ def main():
                 # Combined loss
                 loss = alpha * loss_det + beta * loss_logit_kd + gamma * loss_feature_kd
 
+            if (num_batches + 1) % 50 == 0:
+                logger.info(
+                    f"[Batch {num_batches + 1}] "
+                    f"det={loss_det.item():.3f}, "
+                    f"kd_logit={loss_logit_kd.item():.3f}, "
+                    f"kd_feat={loss_feature_kd.item():.3f}"
+                )
+            
+            if not torch.isfinite(loss):
+                logger.warning(
+                    "Skipping batch due to non-finite loss: "
+                    f"total={loss.item()} det={loss_det.item()} "
+                    f"kd_logit={loss_logit_kd.item()} kd_feat={loss_feature_kd.item()}"
+                )
+                continue
+
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=10.0)
@@ -257,6 +330,9 @@ def main():
                 'kd_f': f"{loss_feature_kd.item():.3f}",
             })
 
+        if num_batches == 0:
+            logger.error("All batches skipped due to non-finite loss. Aborting epoch.")
+            break
         avg_loss = epoch_loss / num_batches
         logger.info(f"Epoch {epoch+1}/{epochs} | Loss: {avg_loss:.4f}")
 
@@ -275,6 +351,7 @@ def main():
                 'loss': avg_loss, 'mAP': mAP,
             }, ckpt_path)
 
+            is_final_epoch = (epoch + 1) == epochs
             if mAP > best_map:
                 best_map = mAP
                 best_path = os.path.join(checkpoint_dir, "best_model.pth")
@@ -284,6 +361,14 @@ def main():
                     'loss': avg_loss, 'mAP': mAP,
                 }, best_path)
                 logger.info(f"New best! mAP: {best_map:.4f}")
+            elif is_final_epoch and best_map == 0.0:
+                best_path = os.path.join(checkpoint_dir, "best_model.pth")
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': student.state_dict(),
+                    'loss': avg_loss, 'mAP': mAP,
+                }, best_path)
+                logger.info(f"Final epoch: saving as best_model.pth (mAP was always 0.0)")
 
     logger.info(f"KD training complete! Best mAP: {best_map:.4f}")
 

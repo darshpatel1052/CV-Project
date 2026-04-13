@@ -291,6 +291,15 @@ def main():
 
                 loss = loss_cls + loss_reg
 
+            # Skip batch if loss is non-finite (NaN/inf) to prevent weight corruption
+            if not torch.isfinite(loss):
+                import logging as _log
+                _log.getLogger("TrainTeacher").warning(
+                    f"Non-finite loss ({loss.item()}) at epoch {epoch+1} batch {batch_idx}. Skipping."
+                )
+                optimizer.zero_grad()
+                continue
+
             scaler.scale(loss).backward()
 
             # Gradient clipping for stability
@@ -335,6 +344,10 @@ def main():
             }, ckpt_path)
             logger.info(f"Saved checkpoint: {ckpt_path}")
 
+            # Save best model (strictly better mAP).
+            # Also always save at the final epoch so best_model.pth always exists
+            # even if mAP never crossed 0 (e.g. all validation epochs had 0 detections).
+            is_final_epoch = (epoch + 1) == epochs
             if mAP > best_map:
                 best_map = mAP
                 best_path = os.path.join(checkpoint_dir, "best_model.pth")
@@ -345,6 +358,16 @@ def main():
                     'loss': avg_total, 'mAP': mAP,
                 }, best_path)
                 logger.info(f"New best model! mAP: {best_map:.4f}")
+            elif is_final_epoch and best_map == 0.0:
+                # mAP never improved — save final epoch weights so KD training can proceed
+                best_path = os.path.join(checkpoint_dir, "best_model.pth")
+                torch.save({
+                    'epoch': epoch + 1,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'loss': avg_total, 'mAP': mAP,
+                }, best_path)
+                logger.info(f"Final epoch: saving as best_model.pth (mAP was always 0.0)")
 
     logger.info(f"Training complete! Best mAP: {best_map:.4f}")
 

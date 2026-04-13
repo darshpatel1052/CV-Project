@@ -24,23 +24,34 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from torch.utils.data import DataLoader
 
-from utils import load_config, setup_logger
+from utils import load_config, setup_logger, postprocess_detections
+from evaluate import get_anchors_for_model
 from data.dataset import DOTADetectionDataset
 from models.teacher import TeacherDetector
 from models.student import StudentDetector
 
 
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+
 def denormalize(img_tensor):
     """
-    Convert a normalized image tensor back to displayable format.
-    
+    Convert an ImageNet-normalized image tensor back to displayable format.
+
+    The dataset normalizes via: img = (img - mean) / std
+    So we invert:              img = img * std + mean
+
     Args:
-        img_tensor: Tensor of shape (3, H, W), values in [0, 1]
-    
+        img_tensor: Tensor of shape (3, H, W), ImageNet-normalized
+                    (values are roughly in [-2.1, +2.6], NOT [0, 1])
+
     Returns:
-        numpy array of shape (H, W, 3), values in [0, 255]
+        numpy array of shape (H, W, 3), values in [0, 255] uint8
     """
-    img = img_tensor.cpu().numpy().transpose(1, 2, 0)
+    img = img_tensor.cpu().numpy().transpose(1, 2, 0)   # (H, W, 3)
+    img = img * IMAGENET_STD + IMAGENET_MEAN             # invert normalization → [0, 1]
+    img = np.clip(img, 0.0, 1.0)                         # clamp numerical noise
     img = (img * 255).astype(np.uint8)
     return img
 
@@ -210,6 +221,7 @@ def main():
     parser.add_argument('--model', type=str, choices=['teacher', 'student_baseline', 'student_kd'],
                        default='student_kd', help='Which model to visualize')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--allow_random', action='store_true', help='Allow random weights if checkpoint missing')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -266,7 +278,9 @@ def main():
         model.load_state_dict(checkpoint['model_state_dict'])
         logger.info(f"✅ Loaded checkpoint from {checkpoint_path}")
     else:
-        logger.warning(f"⚠ Checkpoint not found: {checkpoint_path}")
+        if not args.allow_random:
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}. Use --allow_random to bypass and use random weights.")
+        logger.warning(f"⚠ Checkpoint not found: {checkpoint_path}. Using random weights!")
     
     model = model.to(device)
     model.eval()
@@ -279,6 +293,9 @@ def main():
     # VISUALIZE SAMPLES
     # =========================================================================
     class_names = cfg['dataset']['classes']
+    
+    # Get anchors for decoding predictions
+    anchors = get_anchors_for_model(model, image_size, device)
     
     with torch.no_grad():
         for sample_idx, (images, targets) in enumerate(test_loader):
@@ -298,17 +315,21 @@ def main():
             # =========================================================
             # 1. DETECTION BOXES VISUALIZATION
             # =========================================================
-            logger.info(f"  Drawing detection boxes...")
+            logger.info(f"  Drawing prediction boxes...")
             
-            if 'boxes' in target and len(target['boxes']) > 0:
-                gt_boxes = target['boxes'].numpy()
-                gt_labels = target['labels'].numpy()
-            else:
-                gt_boxes = np.array([])
-                gt_labels = np.array([])
+            preds = postprocess_detections(
+                outputs['cls_logits'], outputs['bbox_regs'],
+                anchors.to(device), image_size=image_size,
+                num_classes=cfg['dataset']['num_classes'],
+                conf_threshold=0.3, nms_threshold=0.5,
+                max_detections=100, use_background=False
+            )[0]
+            
+            pred_boxes = preds['boxes'].cpu().numpy()
+            pred_labels = preds['labels'].cpu().numpy()
             
             fig = visualize_detections(
-                image, gt_boxes, gt_labels, class_names,
+                image, pred_boxes, pred_labels, class_names,
                 save_path=os.path.join(output_dir, f'{args.model}_sample{sample_idx}_boxes.png')
             )
             plt.close(fig)

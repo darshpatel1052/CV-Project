@@ -260,10 +260,11 @@ def match_anchors_to_targets(
         pos_mask[best_anchor_idx] = True
         neg_mask[best_anchor_idx] = False
 
-    # Assign class labels for positive anchors (offset by 1: class 0 -> label 1, etc.)
-    # We use 0 for background, 1..num_classes for object classes
+    # Assign class labels for positive anchors.
+    # FocalLoss expects: 0=background, 1..K=object classes (1-indexed).
+    # Dataset labels are 0-indexed (0..K-1), so we add +1 to offset for FocalLoss.
     matched_gt_indices = best_gt_per_anchor[pos_mask]
-    cls_targets[pos_mask] = gt_labels[matched_gt_indices] + 1  # +1 because 0 = background
+    cls_targets[pos_mask] = gt_labels[matched_gt_indices] + 1  # +1: 0=bg, 1..K=object
 
     # Ensure negatives don't overlap with positives
     neg_mask = neg_mask & (~pos_mask)
@@ -374,7 +375,9 @@ def nms_torch(
     try:
         from torchvision.ops import nms
         return nms(boxes, scores, iou_threshold)
-    except ImportError:
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).debug(f"Torchvision NMS failed ({e}), falling back to manual NMS.")
         pass
 
     # Fallback: manual NMS

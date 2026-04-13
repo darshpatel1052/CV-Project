@@ -62,29 +62,35 @@ class FocalLoss(nn.Module):
         if inputs.numel() == 0:
             return torch.tensor(0.0, device=inputs.device, requires_grad=True)
 
-        # Create one-hot targets: background (0) -> all zeros, class k -> index k-1
-        target_onehot = torch.zeros_like(inputs)
+        # Upcast to float32 to prevent fp16 overflow → NaN under AMP.
+        # binary_cross_entropy_with_logits is numerically unstable in fp16
+        # when logits are large (common in later training epochs).
+        inputs = inputs.float()
+
+        # Create one-hot targets in float32: background (0) → all zeros, class k → index k-1
+        target_onehot = torch.zeros_like(inputs)  # float32 now
         pos_mask = targets > 0
         if pos_mask.any():
             # targets are 1-indexed (1..K), convert to 0-indexed for scatter
-            # .to(target_onehot.dtype) ensures AMP compatibility (float16/float32)
             target_onehot[pos_mask] = F.one_hot(
                 targets[pos_mask] - 1, num_classes
-            ).to(target_onehot.dtype)
+            ).float()
 
-        # Sigmoid activation
+        # Sigmoid activation (in float32)
         p = torch.sigmoid(inputs)
 
         # Compute focal loss per element
         # For positive targets (t=1): pt = p, alpha_t = alpha
         # For negative targets (t=0): pt = 1-p, alpha_t = 1-alpha
         pt = torch.where(target_onehot == 1, p, 1 - p)
-        alpha_t = torch.where(target_onehot == 1, self.alpha, 1 - self.alpha)
+        alpha_t = torch.where(target_onehot == 1,
+                              torch.tensor(self.alpha, device=inputs.device),
+                              torch.tensor(1 - self.alpha, device=inputs.device))
 
         # Focal term
         focal_weight = (1 - pt) ** self.gamma
 
-        # Binary cross-entropy (numerically stable)
+        # Binary cross-entropy — computed in float32, safe from overflow
         bce = F.binary_cross_entropy_with_logits(inputs, target_onehot, reduction='none')
 
         loss = alpha_t * focal_weight * bce
@@ -116,6 +122,10 @@ class SmoothL1Loss(nn.Module):
         """
         if pred.numel() == 0:
             return torch.tensor(0.0, device=pred.device, requires_grad=True)
+
+        # Upcast to float32 to prevent fp16 overflow under AMP
+        pred = pred.float()
+        target = target.float()
 
         diff = torch.abs(pred - target)
         loss = torch.where(

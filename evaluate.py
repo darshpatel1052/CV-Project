@@ -269,6 +269,7 @@ def main():
                 })
 
     results = []
+    skipped = []
 
     for model_info in models_to_eval:
         model_name = model_info['name']
@@ -282,6 +283,7 @@ def main():
 
         if not os.path.exists(ckpt_path):
             logger.warning(f"  ⚠ Checkpoint not found: {ckpt_path} — skipping")
+            skipped.append({'name': model_name, 'checkpoint': ckpt_path, 'reason': 'checkpoint_not_found'})
             continue
 
         # Initialize model
@@ -398,16 +400,32 @@ def main():
             logger.info(f"Model compression:         {compression:.1f}× smaller")
 
     # =========================================================================
-    # SAVE RESULTS
+    # SAVE RESULTS  (always write, even if some/all models were skipped)
     # =========================================================================
-    if args.save_results and results:
+    if args.save_results:
         results_dir = cfg.get('evaluation', {}).get('output_dir', './outputs/metrics')
         os.makedirs(results_dir, exist_ok=True)
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         results_path = os.path.join(results_dir, f'evaluation_{timestamp}.json')
+
+        output = {
+            'timestamp': timestamp,
+            'models_evaluated': len(results),
+            'models_skipped': len(skipped),
+            'results': results,
+            'skipped': skipped,
+        }
+
         with open(results_path, 'w') as f:
-            json.dump(results, f, indent=2)
+            json.dump(output, f, indent=2)
         logger.info(f"\nResults saved to: {results_path}")
+
+        if not results:
+            logger.warning(
+                "⚠  No models were successfully evaluated. "
+                "Check that checkpoints exist in ./checkpoints/. "
+                f"Skipped: {[s['name'] for s in skipped]}"
+            )
 
     logger.info("\n✅ Evaluation complete!")
 

@@ -43,8 +43,8 @@ env/
 *.ipynb
 
 # Logs
-logs/
-*.log
+#logs/
+#*.log
 
 # Model checkpoints (optional, comment out if you want to track)
 checkpoints/
